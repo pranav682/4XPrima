@@ -227,6 +227,74 @@ class AccountState(BaseModel):
         return (self.day_start_equity - self.equity) / self.day_start_equity
 
 
+class Quote(BaseModel):
+    """A bid/ask snapshot for a pair at a moment in time."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pair: str
+    bid: PositiveDecimal
+    ask: PositiveDecimal
+    timestamp: datetime
+
+    @field_validator("pair")
+    @classmethod
+    def _normalize_pair(cls, v: str) -> str:
+        if not v or not v.isalpha():
+            raise ValueError("pair must be alphabetic, e.g. 'EURUSD'")
+        return v.upper()
+
+    @field_validator("timestamp")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
+
+    def model_post_init(self, __context: object) -> None:
+        # pydantic v2 hook — runs after all field validators. We can't enforce
+        # ask >= bid via Field alone because the constraint crosses two fields.
+        if self.ask < self.bid:
+            raise ValueError(f"inverted quote: ask {self.ask} < bid {self.bid}")
+
+    @property
+    def mid(self) -> Decimal:
+        return (self.bid + self.ask) / 2
+
+    @property
+    def spread(self) -> Decimal:
+        return self.ask - self.bid
+
+
+class Fill(BaseModel):
+    """One executed trade. ``direction`` is the side of the *fill itself*:
+    LONG = buy (opens a long, or closes a short); SHORT = sell (opens a short,
+    or closes a long)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pair: str
+    direction: Direction
+    size: PositiveDecimal
+    fill_price: PositiveDecimal
+    commission: NonNegativeDecimal
+    timestamp: datetime
+
+    @field_validator("pair")
+    @classmethod
+    def _normalize_pair(cls, v: str) -> str:
+        if not v or not v.isalpha():
+            raise ValueError("pair must be alphabetic, e.g. 'EURUSD'")
+        return v.upper()
+
+    @field_validator("timestamp")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
+
+    @property
+    def notional(self) -> Decimal:
+        return self.size * self.fill_price
+
+
 class RiskConfig(BaseModel):
     """All risk caps. Frozen at runtime.
 

@@ -8,6 +8,10 @@ Be the single, deterministic, fail-safe gate between a *signal* and an *order*. 
 
 ## Responsibilities
 
+**Intended vs realized risk.** Every cap that is enforced *before* the fill (per-trade, per-pair, correlated, portfolio) measures the **intended** risk computed from `stop_distance` — i.e. the loss that would occur if the stop filled exactly. The **realized** risk (what actually happens when a stop gaps through) is bounded by the *backstop* gates: the drawdown and daily-loss auto-trips. Together they enforce the safety story even when a single fill exceeds its modelled stop loss.
+
+**Reject vs resize.** Only the per-trade cap RESIZES. Portfolio, per-pair, and correlated exposure caps REJECT. This is intentional: resizing one new order to fit an aggregate cap would silently obscure that the *portfolio* is already at its limit. The strategy should see the rejection and decide whether to close something else (the slow-loop optimizer may propose this) — the risk manager doesn't make that call.
+
 For each order produced by a strategy, evaluate the gates **in this order**:
 
 1. **Kill switch** — if engaged, reject immediately.

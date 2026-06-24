@@ -447,6 +447,105 @@ def test_order_request_is_frozen() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Resize-flows-through-downstream-gates (classic risk-engine bug)
+# ---------------------------------------------------------------------------
+
+
+def test_resize_is_evaluated_against_downstream_caps(
+    cfg: RiskConfig, account: AccountState
+) -> None:
+    """When step 6 resizes the order, steps 7-9 must use the RESIZED notional
+    and risk_at_stop — not the original. Otherwise an order would be rejected
+    by a downstream cap that the resized version comfortably satisfies.
+
+    Setup:
+      - equity = 10_000
+      - per-trade cap 0.1% → max risk 10
+      - per-pair cap 50% notional → 5_000
+      - request: size 100_000, entry 1.0, stop 0.95 → stop_distance 0.05
+        * original risk 100_000 * 0.05 = 5_000  (≫ 10, triggers resize)
+        * resized size 10 / 0.05 = 200
+        * resized notional 200 * 1.0 = 200      (well under per-pair 5_000)
+
+    If the implementation checked the ORIGINAL notional (100_000) against the
+    per-pair cap (5_000), this would REJECT. If it correctly uses the resized
+    notional (200), it APPROVES the resized order.
+    """
+    cfg = cfg.model_copy(
+        update={
+            "max_risk_per_trade_pct": Decimal("0.001"),
+            "max_exposure_per_pair_pct": Decimal("0.5"),
+        }
+    )
+    order = make_order(
+        size=Decimal("100000"),
+        entry=Decimal("1.0"),
+        stop=Decimal("0.95"),
+    )
+    rm = RiskManager(cfg)
+    decision = rm.evaluate(order, account)
+
+    assert decision.kind == DecisionKind.RESIZE, (
+        f"expected RESIZE (downstream gates seeing the resized order); got "
+        f"{decision.kind} reason={decision.reason!r}"
+    )
+    assert decision.sized_order is not None
+    assert decision.sized_order.size == Decimal("200")
+    assert decision.sized_order.notional == Decimal("200.00")
+    # The whole point of this test: the size hitting downstream caps is the
+    # resized one, not the originally-requested 100_000.
+    assert decision.sized_order.size < order.size
+
+
+def test_resize_then_correlated_cap_uses_resized_notional(
+    cfg: RiskConfig, account: AccountState
+) -> None:
+    """Same property for the correlated-group gate."""
+    # Tight correlated cap; existing exposure brings the group close to it so
+    # only the small RESIZED notional can fit.
+    cfg = cfg.model_copy(
+        update={
+            "max_risk_per_trade_pct": Decimal("0.001"),
+            "max_correlated_exposure_pct": Decimal("0.5"),
+        }
+    )
+    existing = make_position(
+        pair="GBPUSD",
+        size=Decimal("4500"),
+        entry=Decimal("1.0"),  # notional 4500; under the 5000 cap with room for 500
+        stop=Decimal("0.999"),
+    )
+    account = account.model_copy(update={"open_positions": (existing,)})
+    order = make_order(
+        size=Decimal("100000"),
+        entry=Decimal("1.0"),
+        stop=Decimal("0.95"),
+    )
+    rm = RiskManager(cfg)
+    decision = rm.evaluate(order, account)
+    # original notional 100_000 + existing 4500 ≫ 5000 (would reject)
+    # resized notional 200 + existing 4500 = 4700 ≤ 5000 (must approve)
+    assert decision.kind == DecisionKind.RESIZE
+    assert decision.sized_order is not None
+    assert decision.sized_order.size == Decimal("200")
+
+
+def test_aggregate_caps_reject_not_resize(
+    cfg: RiskConfig, account: AccountState
+) -> None:
+    """Spec contract: per-trade is the only cap that resizes. Portfolio,
+    per-pair, and correlated reject — they do not silently downsize."""
+    cfg = cfg.model_copy(update={"max_portfolio_risk_pct": Decimal("0.00001")})
+    # Below the per-trade cap (5 ≪ 100), so per-trade does not fire — yet
+    # portfolio is so tight that it must reject, not resize.
+    rm = RiskManager(cfg)
+    decision = rm.evaluate(make_order(), account)
+    assert decision.kind == DecisionKind.REJECT
+    assert decision.limiting_rule is RejectionReason.PORTFOLIO_RISK_CAP
+    assert decision.sized_order is None
+
+
+# ---------------------------------------------------------------------------
 # Hash / determinism
 # ---------------------------------------------------------------------------
 
