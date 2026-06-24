@@ -110,3 +110,7 @@ The slow loop **does not have credentials** to flip any of these. The approval a
 - **Written by fast loop:** audit log, fill stream, P&L stream.
 
 Strategy artefacts and risk config are the only objects both loops touch, and **only the fast loop reads them at runtime**; the slow loop merely *proposes* new versions for the human to deploy.
+
+## Venue / instrument layer must stay swappable
+
+Both the price provider (`core.market_data.PriceProvider`) and the broker (`core.broker.Broker`) are Protocols. The OANDA practice adapter is the *first* implementation, not the contract — the eventual live venue can and likely will be a different broker (e.g. a SEBI-registered Indian exchange-traded-currency broker, to match operator residency). Design constraint: no execution-path code may import an OANDA-specific symbol; all venue specifics live behind the Protocols.

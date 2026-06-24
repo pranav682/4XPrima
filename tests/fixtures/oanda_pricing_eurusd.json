@@ -1,0 +1,24 @@
+{
+  "prices": [
+    {
+      "type": "PRICE",
+      "time": "2026-06-24T08:00:00.123456789Z",
+      "bids": [
+        {"price": "1.08475", "liquidity": 10000000}
+      ],
+      "asks": [
+        {"price": "1.08495", "liquidity": 10000000}
+      ],
+      "closeoutBid": "1.08470",
+      "closeoutAsk": "1.08500",
+      "status": "tradeable",
+      "tradeable": true,
+      "quoteHomeConversionFactors": {
+        "positiveUnits": "1.00000000",
+        "negativeUnits": "1.00000000"
+      },
+      "instrument": "EUR_USD"
+    }
+  ],
+  "time": "2026-06-24T08:00:00.123456789Z"
+}

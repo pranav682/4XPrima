@@ -227,6 +227,76 @@ class AccountState(BaseModel):
         return (self.day_start_equity - self.equity) / self.day_start_equity
 
 
+class Granularity(StrEnum):
+    """Bar granularities accepted by OANDA's candles endpoint.
+
+    Names mirror OANDA's `CandlestickGranularity` enum verbatim — keeping
+    them identical removes a translation step when we send the query string.
+    """
+
+    S5 = "S5"
+    S10 = "S10"
+    S15 = "S15"
+    S30 = "S30"
+    M1 = "M1"
+    M2 = "M2"
+    M4 = "M4"
+    M5 = "M5"
+    M10 = "M10"
+    M15 = "M15"
+    M30 = "M30"
+    H1 = "H1"
+    H2 = "H2"
+    H3 = "H3"
+    H4 = "H4"
+    H6 = "H6"
+    H8 = "H8"
+    H12 = "H12"
+    D = "D"
+    W = "W"
+    M = "M"
+
+
+class Candle(BaseModel):
+    """One OHLCV bar at a specific granularity. Frozen.
+
+    ``complete=False`` for the most recent bar when it's still forming. We
+    keep both complete and incomplete in the same model so downstream
+    consumers can decide whether to drop the forming bar themselves.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pair: str
+    granularity: Granularity
+    time: datetime
+    open: PositiveDecimal
+    high: PositiveDecimal
+    low: PositiveDecimal
+    close: PositiveDecimal
+    volume: Annotated[int, Field(ge=0)]
+    complete: bool
+
+    @field_validator("pair")
+    @classmethod
+    def _normalize_pair(cls, v: str) -> str:
+        if not v or not v.isalpha():
+            raise ValueError("pair must be alphabetic, e.g. 'EURUSD'")
+        return v.upper()
+
+    @field_validator("time")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
+
+    def model_post_init(self, __context: object) -> None:
+        if not (self.low <= self.open <= self.high and self.low <= self.close <= self.high):
+            raise ValueError(
+                f"OHLC inconsistent: open={self.open} high={self.high} "
+                f"low={self.low} close={self.close}"
+            )
+
+
 class Quote(BaseModel):
     """A bid/ask snapshot for a pair at a moment in time."""
 
