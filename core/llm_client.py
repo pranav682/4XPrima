@@ -27,7 +27,7 @@ Conventions implemented (see `docs/llm-conventions.md` for the full rationale):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Literal, Protocol
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ MEMORY_TOOL_TYPE: str = "memory_20250818"
 MEMORY_TOOL_NAME: str = "memory"
 
 
-class ModelTier(str, Enum):
+class ModelTier(StrEnum):
     """Which model class to route to. Picked per agent in its spec."""
 
     HAIKU = "haiku"

@@ -134,6 +134,9 @@ class SQLiteUsageRecorder:
             clauses.append("ts_utc < ?")
             params.append(until.astimezone(UTC).isoformat())
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        # The only f-string interpolation is `where`, which is built from a
+        # closed set of literal clause strings — values go through `?` params.
+        # Hence the ruff S608 suppression: no untrusted input reaches the SQL.
         sql = f"""
             SELECT
                 agent_name,
@@ -151,7 +154,7 @@ class SQLiteUsageRecorder:
             {where}
             GROUP BY agent_name
             ORDER BY SUM(total_input_tokens) DESC
-        """
+        """  # noqa: S608
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [

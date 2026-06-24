@@ -46,7 +46,9 @@ multi-provider = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["core", "agents", "strategies", "risk", "execution", "backtest"]
+# Only existing packages. Add `agents`, `strategies`, `execution`, `backtest`
+# entries as those packages land in later stages (see PLAN.md).
+packages = ["core"]
 
 [tool.ruff]
 line-length = 100
