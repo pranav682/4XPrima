@@ -58,7 +58,7 @@ A `Rule` is a typed AST node, not natural language — examples in `skills/backt
 
 ## Model tier and why
 
-**Sonnet** (`claude-sonnet-4-6`) by default. Promote to **Opus** (`claude-opus-4-7`) only for explicit "novel strategy design" sessions invoked by the orchestrator (set by env / config flag). Opus is not justified for routine candidate generation.
+**Sonnet** (`claude-sonnet-4-6`) by default. Promote to **Opus** (`claude-opus-4-8`) only for explicit "novel strategy design" sessions invoked by the orchestrator (set by env / config flag). Opus is not justified for routine candidate generation.
 
 ## System-prompt structure
 

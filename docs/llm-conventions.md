@@ -98,25 +98,39 @@ Verified: 2026-06-23.
 
 ## 2. Context management (long-horizon agents)
 
-Anthropic exposes server-side context editing under the `context_management` request parameter, behind the beta header `anthropic-beta: context-management-2025-06-27`.
+Anthropic exposes server-side context management under the `context_management` request parameter. There are **two distinct mechanisms** and they compose:
 
-> **Note (project brief used a placeholder ID).** The brief mentioned `compact_20260112`. The actual current edit types per Anthropic docs are `clear_tool_uses_20250919` (tool-result clearing) and `clear_thinking_20251015` (thinking-block clearing). We use those.
+| Mechanism | Edit type | Beta header | What it does |
+| --- | --- | --- | --- |
+| **Compaction** | `compact_20260112` | `compact-2026-01-12` | **Summarizes** the pre-trigger history into a single `compaction` content block, preserving the meaning of the thread. |
+| **Clearing** | `clear_thinking_20251015`, `clear_tool_uses_20250919` | `context-management-2025-06-27` | **Deletes** old thinking blocks / tool results outright. No summarization. |
+
+Long-horizon agents typically want **both** enabled: compaction preserves the *thread* once it gets long, while clearing drops *stale, low-signal bulk* (old tool results) without paying summarization cost on them.
+
+The two mechanisms use **separate beta headers**. When both are enabled, send both: `anthropic-beta: compact-2026-01-12, context-management-2025-06-27`. The shared client (`core/llm_client.py`, `required_beta_headers()`) attaches whichever apply.
 
 ### When to enable
 
-Enable for any agent that:
-
-- accumulates many tool results in one session (`backtest_agent` running many backtests; `orchestrator_agent` mid-cycle),
-- runs extended thinking blocks.
-
-For one-shot agents that return a structured JSON in a single turn (e.g. `market_context_agent`), context editing is unnecessary — the call ends before the threshold matters.
+| Agent shape | Compaction | Clear thinking | Clear tool uses |
+| --- | --- | --- | --- |
+| One-shot structured output (e.g. `market_context_agent`) | No | No | No |
+| Many-step tool agent (e.g. `backtest_agent`, `orchestrator_agent` full cycle) | **Yes** | Yes (if thinking on) | **Yes** |
+| Long conversational agent (e.g. `reporting_agent` over a multi-turn approval thread) | **Yes** | Yes (if thinking on) | Optional |
+| Adversarial single-prompt critic (`critic_agent`) | No | No | No |
 
 ### Configuration we use
 
 ```python
 context_management = {
     "edits": [
-        # IMPORTANT: clear_thinking must be listed before clear_tool_uses when both are used.
+        # Order: compaction first, then thinking, then tool uses.
+        # The docs' canonical combined example uses this order.
+        {
+            "type": "compact_20260112",
+            "trigger": {"type": "input_tokens", "value": 120000},   # ≥ 50_000 API min
+            "pause_after_compaction": False,
+            # Omit `instructions` to use the API's default summarization prompt.
+        },
         {
             "type": "clear_thinking_20251015",
             "keep": {"type": "thinking_turns", "value": 2},
@@ -132,9 +146,19 @@ context_management = {
 }
 ```
 
-`clear_at_least` is set so that a clearing actually invalidates enough prefix to be worth the cache cost. `exclude_tools=["memory"]` keeps memory-tool I/O intact (see §2.2).
+`clear_at_least` is set so that a clearing actually invalidates enough prefix to be worth the cache cost. `exclude_tools=["memory"]` keeps memory-tool I/O intact (see §2.2). Compaction trigger sits well above the clear_tool_uses trigger so clearing runs first on a typical cycle; compaction kicks in only on truly long sessions.
 
-Verified: 2026-06-23.
+### Compaction's effect on usage accounting
+
+Compaction returns per-iteration token usage in `usage.iterations` (one entry for the compaction call, one for the message). The top-level `input_tokens` / `output_tokens` cover only the non-compaction iteration. `core.usage_accounting` must sum all iterations to attribute true cost.
+
+### Cache interaction (important)
+
+- Compaction **rewrites the messages tail** — by design — so previous cache entries on `messages` are invalidated at the compaction point. This is the expected cost of summarization; budget for one cache write per compaction.
+- The `system` cache (tools + spec + skills) is untouched by either compaction or clearing, so the expensive stable prefix continues to cache-hit.
+- `clear_tool_uses_20250919`'s `clear_at_least` is the lever to avoid death-by-tiny-clearings: each clearing invalidates from that point onward, so it had better be a worthwhile chunk.
+
+Verified: 2026-06-24.
 
 ### 2.2 Memory tool (optional, opt-in per agent)
 
@@ -176,7 +200,9 @@ Default routing, enforced by `core/llm_client.py` via a model-tier enum:
 | --- | --- | --- | --- |
 | `HAIKU` | `claude-haiku-4-5-20251001` | Cheap classifiers, routing-only orchestrator ticks, status summarisers, reporting agent for short status messages. | Cheapest input/output; cache min is 4k so reserve for short stable prefixes. |
 | `SONNET` (default) | `claude-sonnet-4-6` | Most slow-loop agents: market context, strategy lab, backtest, optimization, orchestrator decisions, reporting deep dives. | Best perf/cost balance; 1k cache minimum means almost any prefix caches. |
-| `OPUS` | `claude-opus-4-7` | The critic, novel strategy-design sessions. | We pay Opus rates only where adversarial reasoning is worth it. |
+| `OPUS` | `claude-opus-4-8` | The critic, novel strategy-design sessions. | We pay Opus rates only where adversarial reasoning is worth it. |
+
+> **On pinning.** From the Claude 4.6 generation onward, model IDs use a dateless format (`claude-opus-4-8`, `claude-sonnet-4-6`) that is itself a pinned snapshot, not an evergreen pointer — so the strings above are stable. Older Haiku still uses the dated form. Bump explicitly when promoting to a newer release.
 
 Pin the **exact model string** in code (`core/llm_client.py`), do not let it drift. Model strings are part of the cache lane — switching models invalidates everything.
 
@@ -248,4 +274,7 @@ Before merging a new agent or modifying an existing one:
 
 ## Changelog
 
-- **2026-06-23** — Initial version. Verified against `platform.claude.com/docs` and `code.claude.com/docs`. Corrected user brief's `compact_20260112` placeholder to the actual identifiers `clear_thinking_20251015` and `clear_tool_uses_20250919`. Pinned model strings: `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-7`.
+- **2026-06-23** — Initial version. Verified against `platform.claude.com/docs` and `code.claude.com/docs`. Pinned model strings: `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-7`.
+- **2026-06-24** — Corrections after a re-verification pass:
+  - **Opus tier bumped** from `claude-opus-4-7` (now legacy) to `claude-opus-4-8` (current Opus, pinned dateless ID under the 4.6-generation naming convention).
+  - **Compaction restored.** `compact_20260112` is a real, current edit type — it was incorrectly removed in the initial version after a doc-fetch summarizer missed it. Documented as a **separate** mechanism from `clear_thinking_20251015` / `clear_tool_uses_20250919` (compaction *summarizes*; clearing *deletes*). Long-horizon agents now configure both. Compaction uses the `compact-2026-01-12` beta header; clearing uses `context-management-2025-06-27`. When both are enabled, both headers are sent.

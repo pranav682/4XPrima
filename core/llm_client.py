@@ -13,8 +13,11 @@ Conventions implemented (see `docs/llm-conventions.md` for the full rationale):
 1. Message structure: tools → system [stable spec + skills, with one
    cache_control breakpoint] → messages [volatile tail].
 2. Model routing by tier (HAIKU / SONNET / OPUS), pinned model strings.
-3. Optional server-side context management (`clear_thinking_20251015` listed
-   before `clear_tool_uses_20250919`) for long-running agents.
+3. Optional server-side context management for long-running agents — composes
+   `compact_20260112` (summarization, preserves the thread) with
+   `clear_thinking_20251015` and `clear_tool_uses_20250919` (deletion of stale
+   thinking blocks / tool results). Each mechanism is gated by a separate beta
+   header; the wrapper attaches both when both are enabled.
 4. Optional Tool Search Tool (`tool_search_tool_bm25_20251119`) with
    `defer_loading: true` on non-essential tools.
 5. Token + cache-hit accounting recorded for every call via
@@ -34,17 +37,34 @@ from typing import Any, Literal, Protocol
 
 MODEL_HAIKU: str = "claude-haiku-4-5-20251001"
 MODEL_SONNET: str = "claude-sonnet-4-6"
-MODEL_OPUS: str = "claude-opus-4-7"
+# Note: `claude-opus-4-8` is a pinned dateless snapshot under the 4.6-generation
+# naming convention — it is the ID itself, not an evergreen alias. Bump
+# explicitly when promoting to a newer Opus.
+MODEL_OPUS: str = "claude-opus-4-8"
 
-# Beta header required for the context_management parameter.
+# Beta header required for the `clear_*` edits in the context_management parameter.
 CONTEXT_MANAGEMENT_BETA: str = "context-management-2025-06-27"
+
+# Beta header required for the `compact_20260112` summarization edit. This is a
+# SEPARATE beta from CONTEXT_MANAGEMENT_BETA — when an agent uses both compaction
+# and clearing, the wrapper emits BOTH headers.
+COMPACTION_BETA: str = "compact-2026-01-12"
 
 # Tool Search Tool identifiers.
 TOOL_SEARCH_REGEX: str = "tool_search_tool_regex_20251119"
 TOOL_SEARCH_BM25: str = "tool_search_tool_bm25_20251119"
 
-# Context-editing identifiers (note: the project brief used a placeholder
-# `compact_20260112`; the verified identifiers per the Anthropic docs are these).
+# Context-management edit identifiers.
+#
+# These are TWO different mechanisms; long-horizon agents typically want both:
+#
+#   - `compact_20260112` SUMMARIZES the pre-trigger history into a single
+#     `compaction` content block, preserving meaning while reclaiming context.
+#   - `clear_thinking_20251015` and `clear_tool_uses_20250919` DELETE old
+#     content (thinking blocks / tool results) — no summarization.
+#
+# Compaction preserves the thread; clearing drops stale, low-signal bulk.
+CONTEXT_EDIT_COMPACT: str = "compact_20260112"
 CONTEXT_EDIT_CLEAR_THINKING: str = "clear_thinking_20251015"
 CONTEXT_EDIT_CLEAR_TOOL_USES: str = "clear_tool_uses_20250919"
 
@@ -121,13 +141,33 @@ class ToolSpec:
 
 @dataclass(frozen=True, slots=True)
 class ContextManagementConfig:
-    """Server-side context-editing config for long-running agents.
+    """Server-side context-management config for long-running agents.
 
-    The wrapper emits the edits in the order `clear_thinking_20251015` first,
-    then `clear_tool_uses_20250919`, as required by the API.
+    Composes two mechanisms (see the constants above for the distinction):
+
+    1. **Compaction** (`compact_20260112`) — summarizes pre-trigger history.
+       Set `enable_compaction=True` to include it. Triggers at
+       `compact_trigger_input_tokens` (API minimum 50,000; we default higher).
+    2. **Clearing** (`clear_thinking_20251015` + `clear_tool_uses_20250919`) —
+       deletes old thinking blocks and tool results.
+
+    Wrapper emits edits in the order [compact, clear_thinking, clear_tool_uses]
+    — matching the API docs' canonical example — and sets both required beta
+    headers iff the corresponding edit is enabled.
     """
 
+    # Compaction (summarization). Disabled by default; opt in per agent.
+    enable_compaction: bool = False
+    compact_trigger_input_tokens: int = 120_000  # ≥ 50_000 per API minimum
+    compact_pause_after: bool = False
+    compact_instructions: str | None = None      # None → use API default prompt
+
+    # Clearing — thinking blocks.
+    enable_clear_thinking: bool = True
     clear_thinking_keep_turns: int = 2
+
+    # Clearing — tool uses/results.
+    enable_clear_tool_uses: bool = True
     clear_tool_uses_trigger_input_tokens: int = 60_000
     clear_tool_uses_keep: int = 5
     clear_tool_uses_clear_at_least_input_tokens: int = 10_000
@@ -313,17 +353,44 @@ def build_context_management(
 ) -> dict[str, Any] | None:
     """Build the `context_management` parameter body, or None to omit it.
 
-    Order matters: `clear_thinking_20251015` MUST be listed before
-    `clear_tool_uses_20250919` per the Anthropic API contract.
+    Emits edits in the order [compact, clear_thinking, clear_tool_uses] — the
+    same order the Anthropic docs use in the canonical combined example. The
+    two clearing edits maintain their documented relative order
+    (`clear_thinking_20251015` before `clear_tool_uses_20250919`); compaction
+    goes first so summarization runs on the raw history before deletions touch
+    what remains.
+
+    Returns None if no edit is enabled (so the caller can skip the parameter
+    and the beta headers entirely).
     """
     if config is None:
         return None
-    return {
-        "edits": [
+
+    edits: list[dict[str, Any]] = []
+
+    if config.enable_compaction:
+        compact_edit: dict[str, Any] = {
+            "type": CONTEXT_EDIT_COMPACT,
+            "trigger": {
+                "type": "input_tokens",
+                "value": config.compact_trigger_input_tokens,
+            },
+            "pause_after_compaction": config.compact_pause_after,
+        }
+        if config.compact_instructions is not None:
+            compact_edit["instructions"] = config.compact_instructions
+        edits.append(compact_edit)
+
+    if config.enable_clear_thinking:
+        edits.append(
             {
                 "type": CONTEXT_EDIT_CLEAR_THINKING,
                 "keep": {"type": "thinking_turns", "value": config.clear_thinking_keep_turns},
-            },
+            }
+        )
+
+    if config.enable_clear_tool_uses:
+        edits.append(
             {
                 "type": CONTEXT_EDIT_CLEAR_TOOL_USES,
                 "trigger": {
@@ -336,9 +403,26 @@ def build_context_management(
                     "value": config.clear_tool_uses_clear_at_least_input_tokens,
                 },
                 "exclude_tools": list(config.exclude_tools_from_clear),
-            },
-        ]
-    }
+            }
+        )
+
+    return {"edits": edits} if edits else None
+
+
+def required_beta_headers(config: ContextManagementConfig | None) -> list[str]:
+    """Beta headers `LLMClient.call` must send for the configured edits.
+
+    Compaction and the clear_* edits are gated by *separate* betas. When both
+    are enabled, both headers must be set.
+    """
+    if config is None:
+        return []
+    headers: list[str] = []
+    if config.enable_compaction:
+        headers.append(COMPACTION_BETA)
+    if config.enable_clear_thinking or config.enable_clear_tool_uses:
+        headers.append(CONTEXT_MANAGEMENT_BETA)
+    return headers
 
 
 # ---------------------------------------------------------------------------

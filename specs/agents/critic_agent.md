@@ -60,7 +60,7 @@ Each `CriticCheckResult`: `{name, pass, evidence_citation, severity}`.
 
 ## Model tier and why
 
-**Opus** (`claude-opus-4-7`). This is the highest-stakes single decision in the slow loop — a wrong `accept` lets a curve-fit go in front of a human under a false halo of validation. Opus's adversarial reasoning is the budget we explicitly pay for. Cache the (long, stable) checklist prompt aggressively; per-call inputs are small.
+**Opus** (`claude-opus-4-8`). This is the highest-stakes single decision in the slow loop — a wrong `accept` lets a curve-fit go in front of a human under a false halo of validation. Opus's adversarial reasoning is the budget we explicitly pay for. Cache the (long, stable) checklist prompt aggressively; per-call inputs are small.
 
 ## System-prompt structure
 
