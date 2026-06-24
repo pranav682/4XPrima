@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "4xprima"
+version = "0.0.1"
+description = "Multi-agent algorithmic forex trading system (paper-only until explicitly approved for live)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "4xPrima" }]
+dependencies = [
+    # --- LLM ---
+    # Direct SDK is the only currently-required runtime path; the Agent SDK is
+    # listed as a candidate in docs/llm-conventions.md — promote to a hard dep
+    # if/when we adopt it.
+    "anthropic>=0.40.0",
+    # --- Config & data ---
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    # --- Logging ---
+    "structlog>=24.1",
+    # --- Numerics / data (used by the deterministic fast loop and backtester) ---
+    "numpy>=1.26",
+    "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "black>=24.3",
+    "mypy>=1.10",
+]
+# Candidates under evaluation — install only when adopted.
+agent-sdk = [
+    "claude-agent-sdk>=0.1",
+]
+multi-provider = [
+    # litellm is a candidate adapter if we ever need provider portability.
+    # NOT used by default — runtime LLM calls go through core/llm_client.py.
+    "litellm>=1.40",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["core", "agents", "strategies", "risk", "execution", "backtest"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",        # pycodestyle / pyflakes
+    "I",                  # isort
+    "B",                  # bugbear
+    "UP",                 # pyupgrade
+    "ASYNC",              # async pitfalls
+    "S",                  # bandit-style security
+    "RUF",                # ruff-specific
+]
+ignore = ["S101"]         # allow assert in tests
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"
