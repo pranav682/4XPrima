@@ -20,6 +20,7 @@ Conventions:
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from datetime import date as _date
 from decimal import Decimal
@@ -228,6 +229,50 @@ class AccountState(BaseModel):
         return (self.day_start_equity - self.equity) / self.day_start_equity
 
 
+class VolState(StrEnum):
+    """Volatility regime for a pair."""
+
+    LOW = "low"
+    NORMAL = "normal"
+    ELEVATED = "elevated"
+    HIGH = "high"
+    UNKNOWN = "unknown"
+
+
+class RiskState(StrEnum):
+    """Cross-market risk appetite tag."""
+
+    RISK_ON = "risk_on"
+    RISK_OFF = "risk_off"
+    NEUTRAL = "neutral"
+    UNKNOWN = "unknown"
+
+
+class TrendState(StrEnum):
+    """Directional / range tag for a pair."""
+
+    TRENDING_UP = "trending_up"
+    TRENDING_DOWN = "trending_down"
+    MEAN_REVERTING = "mean_reverting"
+    RANGE_TIGHT = "range_tight"
+    RANGE_WIDE = "range_wide"
+    EVENT_DRIVEN = "event_driven"
+    UNKNOWN = "unknown"
+
+
+class SentimentLabel(StrEnum):
+    POSITIVE = "positive"
+    NEUTRAL = "neutral"
+    NEGATIVE = "negative"
+    MIXED = "mixed"
+
+
+class FlagSeverity(StrEnum):
+    INFO = "info"
+    WARN = "warn"
+    ALERT = "alert"
+
+
 class ImpactLevel(StrEnum):
     """Impact tag attached to a scheduled economic release.
 
@@ -334,6 +379,201 @@ class NewsEvent(BaseModel):
     @classmethod
     def _utc_only(cls, v: datetime) -> datetime:
         return _require_utc(v)
+
+
+_TRADE_CALL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "go long", "going short", "let's go long"
+    re.compile(r"\b(?:go|going|will go|to go)\s+(?:long|short)\b", re.IGNORECASE),
+    re.compile(r"\benter(?:ing)?\s+(?:a\s+)?(?:long|short)\b", re.IGNORECASE),
+    re.compile(r"\b(?:buy|sell)\s+(?:the|now|at|near|on|signal)\b", re.IGNORECASE),
+    re.compile(r"\b(?:should|recommend|advise)\s+(?:buy|sell|long|short)\b", re.IGNORECASE),
+    re.compile(r"\b(?:long|short|bullish|bearish)\s+bias\b", re.IGNORECASE),
+    re.compile(r"\btake\s+profit\b|\bstop\s+loss\b", re.IGNORECASE),
+    re.compile(r"\btarget\s+(?:price|level)\b", re.IGNORECASE),
+    re.compile(r"\b(?:bullish|bearish)\s+setup\b", re.IGNORECASE),
+)
+
+
+def _scrub_trade_calls(field_name: str, text: str) -> str:
+    """Reject anything that looks like a trade recommendation in a free-text
+    field. Used by :class:`MarketContextReport` text-bearing fields.
+
+    The regex set is intentionally focused on imperative trade language —
+    "USD weaker on CPI surprise" is descriptive and fine; "buy USD now" is
+    not. False positives are preferred over false negatives here: the
+    context agent's contract forbids trade calls in its output entirely.
+    """
+    for pattern in _TRADE_CALL_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            raise ValueError(
+                f"trade-recommendation language in {field_name}: matched {m.group()!r}"
+            )
+    return text
+
+
+class RegimeAssessment(BaseModel):
+    """Regime tags for one currency pair."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pair: str
+    risk_state: RiskState
+    trend_state: TrendState
+    vol_state: VolState
+    confidence: Annotated[Decimal, Field(ge=Decimal("0"), le=Decimal("1"))]
+    rationale: str = ""
+
+    @field_validator("pair")
+    @classmethod
+    def _normalize_pair(cls, v: str) -> str:
+        if not v or not v.isalpha():
+            raise ValueError("pair must be alphabetic, e.g. 'EURUSD'")
+        return v.upper()
+
+    @field_validator("rationale")
+    @classmethod
+    def _no_trade_calls(cls, v: str) -> str:
+        return _scrub_trade_calls("rationale", v)
+
+
+class ScheduledEventSummary(BaseModel):
+    """One scheduled release the agent flagged as material."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    when: datetime
+    currency: str
+    name: str
+    impact: ImpactLevel
+
+    @field_validator("when")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
+
+    @field_validator("currency")
+    @classmethod
+    def _ccy(cls, v: str) -> str:
+        v = v.upper()
+        if not v.isalpha() or len(v) != 3:
+            raise ValueError(f"currency must be ISO-4217, got {v!r}")
+        return v
+
+
+class NotableSurprise(BaseModel):
+    """A past release whose actual diverged meaningfully from forecast."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    when: datetime
+    currency: str
+    name: str
+    actual: Decimal
+    forecast: Decimal
+    surprise: Decimal
+    significance: str = ""
+
+    @field_validator("when")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
+
+    @field_validator("currency")
+    @classmethod
+    def _ccy(cls, v: str) -> str:
+        v = v.upper()
+        if not v.isalpha() or len(v) != 3:
+            raise ValueError(f"currency must be ISO-4217, got {v!r}")
+        return v
+
+    @field_validator("significance")
+    @classmethod
+    def _no_trade_calls(cls, v: str) -> str:
+        return _scrub_trade_calls("significance", v)
+
+
+class SentimentRead(BaseModel):
+    """Sentiment the agent derived FROM HEADLINES.
+
+    Scoped to a currency rather than a pair. GDELT's dictionary tone is not
+    ingested — the agent reads headline text itself; see the
+    market_context_agent spec.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    currency: str
+    label: SentimentLabel
+    score: Annotated[Decimal, Field(ge=Decimal("-1"), le=Decimal("1"))]
+    rationale: str = ""
+
+    @field_validator("currency")
+    @classmethod
+    def _ccy(cls, v: str) -> str:
+        v = v.upper()
+        if not v.isalpha() or len(v) != 3:
+            raise ValueError(f"currency must be ISO-4217, got {v!r}")
+        return v
+
+    @field_validator("rationale")
+    @classmethod
+    def _no_trade_calls(cls, v: str) -> str:
+        return _scrub_trade_calls("rationale", v)
+
+
+class RiskFlagOut(BaseModel):
+    """One named risk flag in the report (e.g. ``FOMC_T+18h``)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    code: str
+    severity: FlagSeverity
+    description: str = ""
+
+    @field_validator("description")
+    @classmethod
+    def _no_trade_calls(cls, v: str) -> str:
+        return _scrub_trade_calls("description", v)
+
+
+class MarketContextReport(BaseModel):
+    """The structured output of :class:`market_context_agent`.
+
+    This model is the agent's contract; downstream consumers (strategy
+    lab, optimization, critic, reporting) only see this — never raw feeds.
+
+    **Invariant.** No trade recommendations, anywhere. Free-text fields
+    are validated against a focused regex of imperative trade language
+    ("go long", "buy now", "long bias", "stop loss", "target price", …).
+    The agent prompt also forbids them; this model is the belt-and-braces
+    machine check.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: str
+    as_of: datetime
+    schema_version: str = "1.0"
+    regimes: tuple[RegimeAssessment, ...] = ()
+    key_scheduled_events: tuple[ScheduledEventSummary, ...] = ()
+    notable_surprises: tuple[NotableSurprise, ...] = ()
+    sentiment: tuple[SentimentRead, ...] = ()
+    risk_flags: tuple[RiskFlagOut, ...] = ()
+    notes: str = ""
+    confidence: Annotated[Decimal, Field(ge=Decimal("0"), le=Decimal("1"))] = Decimal("0.5")
+
+    @field_validator("as_of")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
+
+    @field_validator("notes")
+    @classmethod
+    def _no_trade_calls(cls, v: str) -> str:
+        if len(v) > 1000:
+            raise ValueError("notes must be ≤ 1000 chars")
+        return _scrub_trade_calls("notes", v)
 
 
 class Granularity(StrEnum):

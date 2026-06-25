@@ -8,7 +8,7 @@ Build a structured snapshot of the *current* macro and microstructure environmen
 
 - Pull macro indicators (rates, CPI, NFP, central-bank statements) via tool calls.
 - Pull the upcoming **economic calendar** for the agent's watchlist currencies for the next 24h / 7d windows.
-- Pull recent news and sentiment for the watchlist currencies.
+- Pull recent news headlines for the watchlist currencies. **GDELT's dictionary-based tone score is NOT ingested** — the agent reads headline *text* and derives its own sentiment label. GDELT tone is informative for filtering / locating but too noisy to use as the final sentiment signal at this stage.
 - Classify the **regime** (trending / mean-reverting / event-driven / risk-off / risk-on) per pair.
 - Flag scheduled events likely to widen spreads or invalidate intraday strategies.
 - Emit a single `MarketContextReport` (schema in `skills/market-context-format`).

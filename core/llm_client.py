@@ -1,34 +1,36 @@
 """Shared LLM client for the slow loop.
 
-**All runtime LLM calls in 4xPrima must go through this module.** Direct calls to
-`anthropic.Anthropic().messages.create(...)` from anywhere else are forbidden by
-project convention (`CLAUDE.md`) — they bypass the cache layout, model routing,
-and usage accounting this wrapper enforces.
+**All runtime LLM calls in 4xPrima must go through this module.** Direct calls
+to :func:`anthropic.Anthropic().messages.create` from anywhere else are
+forbidden by project convention (``CLAUDE.md``) — they bypass cache layout,
+model routing, capability resolution, and usage accounting.
 
-This file is a typed STUB. No network calls are made yet. The shapes here are the
-contract every agent will build against once Stage 3 starts (see `PLAN.md`).
+This module encodes the conventions in ``docs/llm-conventions.md`` and the
+hard guard the user flagged: server-side compaction (``compact_20260112``) is
+only valid on Opus 4.6+ and Sonnet 4.6+. Haiku 4.5 calls **must not** carry
+the ``compact-2026-01-12`` beta header. Capability resolution happens
+per-call against the chosen model, never against a global default.
 
-Conventions implemented (see `docs/llm-conventions.md` for the full rationale):
-
-1. Message structure: tools → system [stable spec + skills, with one
-   cache_control breakpoint] → messages [volatile tail].
-2. Model routing by tier (HAIKU / SONNET / OPUS), pinned model strings.
-3. Optional server-side context management for long-running agents — composes
-   `compact_20260112` (summarization, preserves the thread) with
-   `clear_thinking_20251015` and `clear_tool_uses_20250919` (deletion of stale
-   thinking blocks / tool results). Each mechanism is gated by a separate beta
-   header; the wrapper attaches both when both are enabled.
-4. Optional Tool Search Tool (`tool_search_tool_bm25_20251119`) with
-   `defer_loading: true` on non-essential tools.
-5. Token + cache-hit accounting recorded for every call via
-   `core.usage_accounting`.
+Verified against ``platform.claude.com/docs`` (2026-06-24):
+- Compaction supported: Opus 4.6 / 4.7 / 4.8, Sonnet 4.6, Fable 5,
+  Mythos 5 / Mythos Preview.
+- Compaction NOT supported: Haiku 4.5 (and older Sonnets / Opuses).
+- ``clear_thinking_20251015`` and ``clear_tool_uses_20250919`` work on all
+  supported models with beta ``context-management-2025-06-27``.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol, TypeVar
+
+import anthropic
+import structlog
+from pydantic import BaseModel, ValidationError
+
+from core.config import AnthropicSettings
 
 # ---------------------------------------------------------------------------
 # Pinned model strings (single source of truth — see docs/llm-conventions.md §4).
@@ -37,40 +39,27 @@ from typing import Any, Literal, Protocol
 
 MODEL_HAIKU: str = "claude-haiku-4-5-20251001"
 MODEL_SONNET: str = "claude-sonnet-4-6"
-# Note: `claude-opus-4-8` is a pinned dateless snapshot under the 4.6-generation
-# naming convention — it is the ID itself, not an evergreen alias. Bump
-# explicitly when promoting to a newer Opus.
 MODEL_OPUS: str = "claude-opus-4-8"
 
-# Beta header required for the `clear_*` edits in the context_management parameter.
+# Beta headers
 CONTEXT_MANAGEMENT_BETA: str = "context-management-2025-06-27"
-
-# Beta header required for the `compact_20260112` summarization edit. This is a
-# SEPARATE beta from CONTEXT_MANAGEMENT_BETA — when an agent uses both compaction
-# and clearing, the wrapper emits BOTH headers.
 COMPACTION_BETA: str = "compact-2026-01-12"
 
-# Tool Search Tool identifiers.
+# Tool Search Tool identifiers
 TOOL_SEARCH_REGEX: str = "tool_search_tool_regex_20251119"
 TOOL_SEARCH_BM25: str = "tool_search_tool_bm25_20251119"
 
-# Context-management edit identifiers.
-#
-# These are TWO different mechanisms; long-horizon agents typically want both:
-#
-#   - `compact_20260112` SUMMARIZES the pre-trigger history into a single
-#     `compaction` content block, preserving meaning while reclaiming context.
-#   - `clear_thinking_20251015` and `clear_tool_uses_20250919` DELETE old
-#     content (thinking blocks / tool results) — no summarization.
-#
-# Compaction preserves the thread; clearing drops stale, low-signal bulk.
+# Context-management edit identifiers
 CONTEXT_EDIT_COMPACT: str = "compact_20260112"
 CONTEXT_EDIT_CLEAR_THINKING: str = "clear_thinking_20251015"
 CONTEXT_EDIT_CLEAR_TOOL_USES: str = "clear_tool_uses_20250919"
 
-# Memory tool identifier.
+# Memory tool identifier
 MEMORY_TOOL_TYPE: str = "memory_20250818"
 MEMORY_TOOL_NAME: str = "memory"
+
+# Name of the synthetic tool the wrapper adds for structured output.
+STRUCTURED_OUTPUT_TOOL_NAME: Final[str] = "submit_structured_output"
 
 
 class ModelTier(StrEnum):
@@ -82,7 +71,6 @@ class ModelTier(StrEnum):
 
 
 def model_for_tier(tier: ModelTier) -> str:
-    """Resolve a tier to its pinned model string. Bump constants above to change."""
     return {
         ModelTier.HAIKU: MODEL_HAIKU,
         ModelTier.SONNET: MODEL_SONNET,
@@ -90,23 +78,32 @@ def model_for_tier(tier: ModelTier) -> str:
     }[tier]
 
 
+# Capability matrix — which beta features each tier supports. The user
+# flagged this as the guard for the project: compaction MUST NEVER ride a
+# Haiku call. Resolution happens at call time against the CHOSEN tier.
+_TIER_SUPPORTS_COMPACTION: Final[dict[ModelTier, bool]] = {
+    ModelTier.HAIKU: False,
+    ModelTier.SONNET: True,
+    ModelTier.OPUS: True,
+}
+
+
+def tier_supports_compaction(tier: ModelTier) -> bool:
+    """Public predicate: may a call on this tier carry compaction?
+
+    Documented separately so tests and callers can both read it.
+    """
+    return _TIER_SUPPORTS_COMPACTION[tier]
+
+
 # ---------------------------------------------------------------------------
-# Message-assembly types.
-#
-# The cacheable system prefix is built out of *blocks*: an agent spec block plus
-# one block per referenced skill. The wrapper places exactly one `cache_control`
-# breakpoint on the last block of the stable prefix.
+# Message-assembly types
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class StableBlock:
-    """A piece of the stable prefix (agent spec, a skill, taxonomy, etc.).
-
-    `kind` is a short tag used by the cache regression test and the usage log
-    so we can tell which blocks compose the prefix. The text must be
-    byte-identical across calls for the cache to hit.
-    """
+    """A piece of the stable prefix (agent spec, a skill, taxonomy, etc.)."""
 
     kind: Literal["spec", "skill", "taxonomy", "schema", "policy_stable"]
     name: str
@@ -115,23 +112,17 @@ class StableBlock:
 
 @dataclass(frozen=True, slots=True)
 class VolatilePolicy:
-    """Per-call policy overrides that go AFTER the cache breakpoint.
-
-    Use sparingly. Anything that changes per call belongs here, not in
-    `StableBlock`s — putting it in the stable prefix breaks caching.
-    """
+    """Per-call policy overrides that go AFTER the cache breakpoint inside
+    ``system``. Use sparingly; anything that changes per call belongs here."""
 
     text: str
 
 
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
-    """One tool definition. `defer_loading=True` keeps it out of the eager prefix.
-
-    Default to deferred for everything that isn't called every turn. Keep the
-    Tool Search Tool itself eager (`defer_loading=False`) — it cannot be
-    deferred or the API rejects the request.
-    """
+    """One tool definition. ``defer_loading=True`` keeps it out of the eager
+    prefix; the Tool Search Tool is added automatically when any tool is
+    deferred."""
 
     name: str
     description: str
@@ -143,30 +134,20 @@ class ToolSpec:
 class ContextManagementConfig:
     """Server-side context-management config for long-running agents.
 
-    Composes two mechanisms (see the constants above for the distinction):
-
-    1. **Compaction** (`compact_20260112`) — summarizes pre-trigger history.
-       Set `enable_compaction=True` to include it. Triggers at
-       `compact_trigger_input_tokens` (API minimum 50,000; we default higher).
-    2. **Clearing** (`clear_thinking_20251015` + `clear_tool_uses_20250919`) —
-       deletes old thinking blocks and tool results.
-
-    Wrapper emits edits in the order [compact, clear_thinking, clear_tool_uses]
-    — matching the API docs' canonical example — and sets both required beta
-    headers iff the corresponding edit is enabled.
+    Caller's *desired* configuration. The wrapper resolves what is actually
+    valid for the chosen tier (see :func:`resolve_context_management`). A
+    Haiku call with ``enable_compaction=True`` SILENTLY drops compaction and
+    its beta; the other edits still apply.
     """
 
-    # Compaction (summarization). Disabled by default; opt in per agent.
     enable_compaction: bool = False
-    compact_trigger_input_tokens: int = 120_000  # ≥ 50_000 per API minimum
+    compact_trigger_input_tokens: int = 120_000
     compact_pause_after: bool = False
-    compact_instructions: str | None = None      # None → use API default prompt
+    compact_instructions: str | None = None
 
-    # Clearing — thinking blocks.
     enable_clear_thinking: bool = True
     clear_thinking_keep_turns: int = 2
 
-    # Clearing — tool uses/results.
     enable_clear_tool_uses: bool = True
     clear_tool_uses_trigger_input_tokens: int = 60_000
     clear_tool_uses_keep: int = 5
@@ -176,54 +157,29 @@ class ContextManagementConfig:
 
 @dataclass(frozen=True, slots=True)
 class AgentRequest:
-    """Everything `LLMClient.call` needs.
+    """Everything :meth:`LLMClient.call_structured` needs."""
 
-    Fields ordered to mirror the on-the-wire layout: identification, then the
-    stable prefix, then volatile tail, then config knobs.
-    """
-
-    # Identification (for accounting; never sent to the model).
     agent_name: str
     run_id: str
-
-    # Model routing.
     tier: ModelTier
 
-    # Tools. The wrapper splits these into eager and deferred groups and emits a
-    # Tool Search Tool when any deferred tools are present.
     tools: tuple[ToolSpec, ...] = ()
-
-    # Stable prefix — order is preserved exactly.
     stable_system_blocks: tuple[StableBlock, ...] = ()
-
-    # Per-call policy that lives AFTER the cache breakpoint inside `system`.
     volatile_policy: VolatilePolicy | None = None
-
-    # Conversation. The final user turn carries the volatile payload (timestamps,
-    # candidate JSON, etc.). Anthropic's hierarchy means everything in `messages`
-    # is naturally after the prefix.
     messages: tuple[dict[str, Any], ...] = ()
 
-    # Output sizing.
     max_output_tokens: int = 2048
-
-    # Optional knobs.
     context_management: ContextManagementConfig | None = None
     enable_memory_tool: bool = False
     cache_ttl: Literal["5m", "1h"] = "5m"
     tool_search_variant: Literal["bm25", "regex"] = "bm25"
 
-    # Free-form metadata stored on the usage row (e.g. cycle phase).
     extra_metadata: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class TokenUsage:
-    """Token accounting for a single call. Mirrors the Anthropic usage object.
-
-    `cache_hit_ratio` is derived; never trust a hand-computed total — sum the
-    three input fields and compare.
-    """
+    """Token accounting for a single call."""
 
     input_tokens: int
     cache_read_input_tokens: int
@@ -246,28 +202,35 @@ class TokenUsage:
 
 @dataclass(frozen=True, slots=True)
 class AgentResponse:
-    """What `LLMClient.call` returns.
-
-    `raw_blocks` is the model's content array (mixed text / tool_use / etc.); the
-    caller is responsible for shape-checking against its agent's output schema.
-    """
+    """Metadata about one LLM call. Decoupled from the parsed output so
+    structured-output callers can return ``(parsed_model, AgentResponse)``."""
 
     agent_name: str
     run_id: str
     model: str
+    tier: ModelTier
     stop_reason: str
     usage: TokenUsage
-    raw_blocks: list[dict[str, Any]]
-    # If context editing fired, what it cleared. Empty otherwise.
+    betas_sent: tuple[str, ...]
     applied_context_edits: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
-# Wire-format assembly.
-#
-# These helpers translate `AgentRequest` into the Anthropic Messages API shape.
-# They are pure: identical input → identical bytes → cache hit. Test that
-# property.
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class LlmClientError(Exception):
+    """Unrecoverable LLM call failure.
+
+    Wraps anthropic SDK errors and schema-validation failures. Error messages
+    never include the API key (the SDK error already redacts it; we also do
+    not log SecretStr.get_secret_value()).
+    """
+
+
+# ---------------------------------------------------------------------------
+# Wire-format assembly
 # ---------------------------------------------------------------------------
 
 
@@ -276,14 +239,11 @@ def build_system_blocks(
     volatile_policy: VolatilePolicy | None,
     cache_ttl: Literal["5m", "1h"],
 ) -> list[dict[str, Any]]:
-    """Build the `system` array.
+    """Build the ``system`` array.
 
-    The single explicit `cache_control` marker is placed on the LAST stable
+    The single explicit ``cache_control`` marker is placed on the LAST stable
     block. Volatile policy (if any) is appended after with no cache_control —
     so it never enters the cache and never invalidates it.
-
-    Raises:
-        ValueError: if `stable_blocks` is empty (we always cache the spec).
     """
     if not stable_blocks:
         raise ValueError("stable_blocks must not be empty — cache the agent spec")
@@ -300,7 +260,6 @@ def build_system_blocks(
         system.append(item)
 
     if volatile_policy is not None:
-        # Explicitly no cache_control here.
         system.append({"type": "text", "text": volatile_policy.text})
 
     return system
@@ -310,12 +269,14 @@ def build_tools(
     tools: tuple[ToolSpec, ...],
     tool_search_variant: Literal["bm25", "regex"],
     enable_memory_tool: bool,
+    structured_output_tool: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Assemble the `tools` array.
+    """Assemble the ``tools`` array.
 
-    Adds a Tool Search Tool entry (eager) whenever any user-supplied tool is
-    deferred, so the model can discover the deferred ones at runtime. Adds the
-    memory tool (eager) if `enable_memory_tool=True`.
+    Adds a Tool Search Tool when any user tool is deferred; adds the memory
+    tool when ``enable_memory_tool=True``. The optional structured-output
+    tool is appended last (eager — never deferred), so callers forcing a
+    tool call (structured output) can find it.
     """
     out: list[dict[str, Any]] = []
 
@@ -337,50 +298,61 @@ def build_tools(
             }
         )
 
-    # The API rejects requests where every tool is deferred. With Tool Search /
-    # memory above we usually satisfy this; the guard is a belt-and-braces check.
+    if structured_output_tool is not None:
+        out.append(structured_output_tool)
+
     if out and all(item.get("defer_loading") for item in out):
         raise ValueError(
-            "all tools deferred — keep the Tool Search Tool eager or mark one tool "
-            "non-deferred"
+            "all tools deferred — keep the Tool Search Tool / structured-output "
+            "tool eager or mark one tool non-deferred"
         )
 
     return out
 
 
-def build_context_management(
+# ---------------------------------------------------------------------------
+# Tier-aware context-management resolution (THE compaction guard)
+# ---------------------------------------------------------------------------
+
+
+def resolve_context_management(
     config: ContextManagementConfig | None,
-) -> dict[str, Any] | None:
-    """Build the `context_management` parameter body, or None to omit it.
+    tier: ModelTier,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Resolve the ``context_management`` payload AND required beta headers
+    for the chosen tier.
 
-    Emits edits in the order [compact, clear_thinking, clear_tool_uses] — the
-    same order the Anthropic docs use in the canonical combined example. The
-    two clearing edits maintain their documented relative order
-    (`clear_thinking_20251015` before `clear_tool_uses_20250919`); compaction
-    goes first so summarization runs on the raw history before deletions touch
-    what remains.
+    The compaction guard lives here: if ``tier`` is Haiku and the caller
+    asked for compaction, compaction is silently dropped. The
+    ``compact-2026-01-12`` beta is also dropped. Clearing edits still apply.
 
-    Returns None if no edit is enabled (so the caller can skip the parameter
-    and the beta headers entirely).
+    Returns ``(context_management_body | None, list[str] of beta headers)``.
     """
     if config is None:
-        return None
+        return None, []
 
     edits: list[dict[str, Any]] = []
+    betas: list[str] = []
 
+    # 1. Compaction (capability-gated).
     if config.enable_compaction:
-        compact_edit: dict[str, Any] = {
-            "type": CONTEXT_EDIT_COMPACT,
-            "trigger": {
-                "type": "input_tokens",
-                "value": config.compact_trigger_input_tokens,
-            },
-            "pause_after_compaction": config.compact_pause_after,
-        }
-        if config.compact_instructions is not None:
-            compact_edit["instructions"] = config.compact_instructions
-        edits.append(compact_edit)
+        if tier_supports_compaction(tier):
+            compact_edit: dict[str, Any] = {
+                "type": CONTEXT_EDIT_COMPACT,
+                "trigger": {
+                    "type": "input_tokens",
+                    "value": config.compact_trigger_input_tokens,
+                },
+                "pause_after_compaction": config.compact_pause_after,
+            }
+            if config.compact_instructions is not None:
+                compact_edit["instructions"] = config.compact_instructions
+            edits.append(compact_edit)
+            betas.append(COMPACTION_BETA)
+        # else: silently drop. The user's stated guard — Haiku must never
+        # carry the compaction beta — is enforced by NOT appending here.
 
+    # 2. Thinking clearing.
     if config.enable_clear_thinking:
         edits.append(
             {
@@ -389,6 +361,7 @@ def build_context_management(
             }
         )
 
+    # 3. Tool-use clearing.
     if config.enable_clear_tool_uses:
         edits.append(
             {
@@ -406,32 +379,20 @@ def build_context_management(
             }
         )
 
-    return {"edits": edits} if edits else None
-
-
-def required_beta_headers(config: ContextManagementConfig | None) -> list[str]:
-    """Beta headers `LLMClient.call` must send for the configured edits.
-
-    Compaction and the clear_* edits are gated by *separate* betas. When both
-    are enabled, both headers must be set.
-    """
-    if config is None:
-        return []
-    headers: list[str] = []
-    if config.enable_compaction:
-        headers.append(COMPACTION_BETA)
+    # 4. The clear_* edits ride the context-management beta.
     if config.enable_clear_thinking or config.enable_clear_tool_uses:
-        headers.append(CONTEXT_MANAGEMENT_BETA)
-    return headers
+        betas.append(CONTEXT_MANAGEMENT_BETA)
+
+    return ({"edits": edits} if edits else None), betas
 
 
 # ---------------------------------------------------------------------------
-# Client.
+# Usage accounting interop
 # ---------------------------------------------------------------------------
 
 
 class UsageRecorder(Protocol):
-    """Anything that can persist a usage row. See `core.usage_accounting`."""
+    """Anything that can persist a usage row. See :mod:`core.usage_accounting`."""
 
     def record(
         self,
@@ -444,51 +405,273 @@ class UsageRecorder(Protocol):
     ) -> None: ...
 
 
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+
+T = TypeVar("T", bound=BaseModel)
+
+
 class LLMClient:
-    """Thin wrapper around the Anthropic Messages API.
+    """Thin Anthropic SDK wrapper enforcing the project's conventions.
 
-    Not implemented yet — this stub fixes the surface every agent will build
-    against in Stage 3. When implemented, `call()` will:
+    Construction:
 
-      1. Resolve the tier to a pinned model string.
-      2. Build the `tools`, `system`, and (passthrough) `messages` arrays.
-      3. Call `messages.create(...)` with the `context-management-2025-06-27`
-         beta header iff `context_management` is set.
-      4. Read `usage` off the response, log it via `UsageRecorder`.
-      5. Return a typed `AgentResponse`.
+        >>> client = LLMClient(settings, usage_recorder=recorder)
 
-    The wrapper never holds broker credentials, never places trades, and is
-    never invoked from the fast loop.
+    Calls:
+
+        >>> parsed, meta = client.call_structured(
+        ...     request=AgentRequest(...),
+        ...     output_model=MarketContextReport,
+        ... )
+
+    The wrapper:
+
+      1. Resolves the tier to a pinned model string.
+      2. Builds the ``tools``, ``system``, and ``messages`` arrays per the
+         caching conventions (one ``cache_control`` on the last stable block).
+      3. Resolves ``context_management`` and required betas FOR THE CHOSEN
+         TIER (Haiku never carries the compaction beta).
+      4. Forces the model to call a structured-output tool whose schema is
+         derived from ``output_model``.
+      5. Parses the tool call into ``output_model``, raising
+         :class:`LlmClientError` on schema-validation failure.
+      6. Records token usage via :class:`UsageRecorder`.
     """
 
     def __init__(
         self,
+        settings: AnthropicSettings,
         *,
-        anthropic_api_key: str,
-        usage_recorder: UsageRecorder,
+        usage_recorder: UsageRecorder | None = None,
+        anthropic_client: Any | None = None,
+        logger: structlog.stdlib.BoundLogger | None = None,
     ) -> None:
-        # Hold creds and recorder. The actual SDK client is constructed lazily
-        # in `call()` so unit tests don't need network access.
-        self._anthropic_api_key = anthropic_api_key
+        self._settings = settings
         self._usage_recorder = usage_recorder
+        # `anthropic_client` is injectable so tests don't have to monkeypatch
+        # the SDK module-level constructor.
+        if anthropic_client is None:
+            self._client = anthropic.Anthropic(api_key=settings.api_key.get_secret_value())
+        else:
+            self._client = anthropic_client
+        self._logger = (
+            logger if logger is not None else _default_logger()
+        ).bind(component="llm_client")
 
-    def call(self, request: AgentRequest) -> AgentResponse:
-        """Issue one structured agent call.
+    def call_structured(
+        self,
+        request: AgentRequest,
+        *,
+        output_model: type[T],
+    ) -> tuple[T, AgentResponse]:
+        """Issue one agent call and return the parsed structured output.
 
-        STUB: raises NotImplementedError. The wire-format assembly helpers above
-        are real and unit-testable; the network round-trip will land in Stage 3.
+        The wrapper adds a forced tool call whose input_schema is
+        ``output_model.model_json_schema()``. The model's response must be
+        a single tool_use block invoking that tool; the input dict is
+        validated into ``output_model``.
+
+        Raises:
+            LlmClientError: on SDK failure, missing tool call, or
+                schema validation failure. Never includes the API key.
         """
-        # Sanity-check the request shape now so future tests have something
-        # to assert on. `build_*` helpers raise on misuse.
-        _ = build_tools(request.tools, request.tool_search_variant, request.enable_memory_tool)
-        _ = build_system_blocks(
+        # 1. Resolve tier → model.
+        model = model_for_tier(request.tier)
+
+        # 2. Build system / tools / messages.
+        system = build_system_blocks(
             request.stable_system_blocks,
             request.volatile_policy,
             request.cache_ttl,
         )
-        _ = build_context_management(request.context_management)
-        _ = model_for_tier(request.tier)
-
-        raise NotImplementedError(
-            "core.llm_client.LLMClient.call is a stub. Implement in Stage 3 — see PLAN.md."
+        structured_tool = _build_structured_output_tool(output_model)
+        tools = build_tools(
+            request.tools,
+            request.tool_search_variant,
+            request.enable_memory_tool,
+            structured_output_tool=structured_tool,
         )
+
+        # 3. Resolve context_management + betas for THIS tier (the guard).
+        ctx_mgmt, betas = resolve_context_management(request.context_management, request.tier)
+
+        # 4. Compose call kwargs.
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": request.max_output_tokens,
+            "system": system,
+            "messages": list(request.messages),
+            "tools": tools,
+            "tool_choice": {"type": "tool", "name": STRUCTURED_OUTPUT_TOOL_NAME},
+        }
+        if ctx_mgmt is not None:
+            kwargs["context_management"] = ctx_mgmt
+        if betas:
+            kwargs["betas"] = betas
+
+        self._logger.info(
+            "llm_call_dispatch",
+            agent_name=request.agent_name,
+            run_id=request.run_id,
+            tier=request.tier.value,
+            model=model,
+            n_stable_blocks=len(request.stable_system_blocks),
+            n_messages=len(request.messages),
+            n_tools=len(tools),
+            betas=list(betas),
+            has_context_management=ctx_mgmt is not None,
+        )
+
+        # 5. Make the call. The `client.beta.messages.create` path accepts
+        #    both legacy and beta kwargs; calls with empty `betas` are
+        #    equivalent to a normal call.
+        try:
+            response = self._client.beta.messages.create(**kwargs)
+        except anthropic.AnthropicError as e:
+            # The SDK's error repr does not include the API key, but defend
+            # against future changes by stringifying explicitly here.
+            raise LlmClientError(f"Anthropic API error: {type(e).__name__}: {e}") from e
+        except Exception as e:
+            raise LlmClientError(f"unexpected error from Anthropic SDK: {e!r}") from e
+
+        # 6. Parse the response: locate the tool_use block, validate input.
+        tool_input = _extract_tool_input(response)
+        try:
+            parsed = output_model(**tool_input)
+        except ValidationError as e:
+            raise LlmClientError(
+                f"model output failed schema validation for "
+                f"{output_model.__name__}: {e}"
+            ) from e
+
+        # 7. Token accounting.
+        usage = _extract_usage(response)
+        meta = AgentResponse(
+            agent_name=request.agent_name,
+            run_id=request.run_id,
+            model=model,
+            tier=request.tier,
+            stop_reason=getattr(response, "stop_reason", "") or "",
+            usage=usage,
+            betas_sent=tuple(betas),
+            applied_context_edits=_extract_applied_edits(response),
+        )
+        if self._usage_recorder is not None:
+            self._usage_recorder.record(
+                agent_name=request.agent_name,
+                run_id=request.run_id,
+                model=model,
+                usage=usage,
+                extra={"tier": request.tier.value, **request.extra_metadata},
+            )
+        return parsed, meta
+
+
+# ---------------------------------------------------------------------------
+# Helpers (response parsing)
+# ---------------------------------------------------------------------------
+
+
+def _build_structured_output_tool(output_model: type[BaseModel]) -> dict[str, Any]:
+    """Build the forced-tool definition for structured output."""
+    schema = output_model.model_json_schema()
+    return {
+        "name": STRUCTURED_OUTPUT_TOOL_NAME,
+        "description": (
+            f"Submit the structured response as a {output_model.__name__}. "
+            "Call this tool exactly once with all required fields filled."
+        ),
+        "input_schema": schema,
+    }
+
+
+def _extract_tool_input(response: Any) -> dict[str, Any]:
+    """Find the structured-output tool's input in the response content.
+
+    The Anthropic SDK response.content is a list of blocks. We skip thinking
+    / text blocks and pick the tool_use one whose ``name`` matches our
+    synthetic tool. If we don't find one, the model didn't honour tool_choice
+    — that's an :class:`LlmClientError`, not a parse-as-best-effort case.
+    """
+    content = getattr(response, "content", None) or []
+    for block in content:
+        # Anthropic blocks are objects; tests may pass plain dicts.
+        block_type = getattr(block, "type", None) or (
+            block.get("type") if isinstance(block, dict) else None
+        )
+        if block_type != "tool_use":
+            continue
+        name = getattr(block, "name", None) or (
+            block.get("name") if isinstance(block, dict) else None
+        )
+        if name != STRUCTURED_OUTPUT_TOOL_NAME:
+            continue
+        input_obj = getattr(block, "input", None) or (
+            block.get("input") if isinstance(block, dict) else None
+        )
+        if not isinstance(input_obj, dict):
+            raise LlmClientError(
+                f"tool_use block for {STRUCTURED_OUTPUT_TOOL_NAME} had non-dict input"
+            )
+        return input_obj
+    raise LlmClientError(
+        f"response did not include a tool_use for {STRUCTURED_OUTPUT_TOOL_NAME}"
+    )
+
+
+def _extract_usage(response: Any) -> TokenUsage:
+    """Read `response.usage.*`, defaulting missing fields to 0.
+
+    Compaction iterations (when enabled and triggered) are not aggregated
+    here yet — that's a future extension; this stage's only consumer
+    (market_context_agent) is a single-turn structured output.
+    """
+    usage_obj = getattr(response, "usage", None)
+    if usage_obj is None:
+        return TokenUsage(0, 0, 0, 0)
+    return TokenUsage(
+        input_tokens=int(getattr(usage_obj, "input_tokens", 0) or 0),
+        cache_read_input_tokens=int(getattr(usage_obj, "cache_read_input_tokens", 0) or 0),
+        cache_creation_input_tokens=int(
+            getattr(usage_obj, "cache_creation_input_tokens", 0) or 0
+        ),
+        output_tokens=int(getattr(usage_obj, "output_tokens", 0) or 0),
+    )
+
+
+def _extract_applied_edits(response: Any) -> list[dict[str, Any]]:
+    cm = getattr(response, "context_management", None)
+    if cm is None:
+        return []
+    applied = getattr(cm, "applied_edits", None) or []
+    out: list[dict[str, Any]] = []
+    for edit in applied:
+        if isinstance(edit, dict):
+            out.append(edit)
+        else:
+            # Best-effort: dump attributes that look like fields.
+            out.append({k: getattr(edit, k) for k in dir(edit) if not k.startswith("_")})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+
+def _default_logger() -> structlog.stdlib.BoundLogger:
+    if not structlog.is_configured():
+        structlog.configure(
+            processors=[
+                structlog.processors.add_log_level,
+                structlog.processors.TimeStamper(fmt="iso", utc=True),
+                structlog.processors.JSONRenderer(),
+            ],
+            wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+            logger_factory=structlog.PrintLoggerFactory(),
+            cache_logger_on_first_use=True,
+        )
+    return structlog.get_logger("core.llm_client")
