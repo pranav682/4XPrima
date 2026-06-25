@@ -21,11 +21,12 @@ Conventions:
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from datetime import date as _date
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -225,6 +226,114 @@ class AccountState(BaseModel):
         if self.equity <= 0:
             return Decimal("1")
         return (self.day_start_equity - self.equity) / self.day_start_equity
+
+
+class ImpactLevel(StrEnum):
+    """Impact tag attached to a scheduled economic release.
+
+    `UNKNOWN` is a safe fallback for sources that occasionally emit values
+    outside the documented set — we never silently drop a release just because
+    its impact label is unfamiliar.
+    """
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    HOLIDAY = "holiday"
+    UNKNOWN = "unknown"
+
+
+class EconomicEvent(BaseModel):
+    """One scheduled (or recently released) economic data point.
+
+    ``actual`` / ``forecast`` / ``previous`` are the parsed numeric values
+    (with suffix handling for K/M/B/T, %, $, commas). The raw source strings
+    are preserved alongside so we never lose the original. ``surprise`` is a
+    computed field — ``actual - forecast`` when both are numeric, ``None``
+    otherwise — so downstream consumers don't reinvent the calculation per
+    agent / report.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    when: datetime                # UTC, the release time
+    currency: str                 # ISO-4217: "USD", "EUR", "GBP", ...
+    name: str
+    impact: ImpactLevel
+
+    raw_actual: str | None = None
+    raw_forecast: str | None = None
+    raw_previous: str | None = None
+
+    actual: Decimal | None = None
+    forecast: Decimal | None = None
+    previous: Decimal | None = None
+
+    @field_validator("when")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
+
+    @field_validator("currency")
+    @classmethod
+    def _validate_ccy(cls, v: str) -> str:
+        v = v.upper()
+        if not v.isalpha() or len(v) != 3:
+            raise ValueError(f"currency must be ISO-4217 (3 letters), got {v!r}")
+        return v
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def surprise(self) -> Decimal | None:
+        """``actual - forecast`` when both are numeric; ``None`` otherwise.
+
+        Computed deterministically so every agent / report sees the same
+        number. If either input is missing or unparseable (e.g. "Tentative",
+        empty string), the answer is ``None``, never a guess.
+        """
+        if self.actual is None or self.forecast is None:
+            return None
+        return self.actual - self.forecast
+
+
+class MacroSeriesPoint(BaseModel):
+    """One observation in a FRED-style macro time series.
+
+    ``value`` is ``None`` for explicitly-missing observations (FRED encodes
+    these as ``"."``). Callers decide whether to skip or interpolate; we
+    refuse to silently coerce missing data to 0.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    series_id: str
+    date: _date
+    value: Decimal | None = None
+
+
+class NewsEvent(BaseModel):
+    """One news article reference, deduplicated by URL upstream.
+
+    ``tone``, ``themes``, and ``entities`` are optional — many sources
+    (GDELT's basic article list, for instance) don't populate them per
+    article. Treat empty tuples and ``None`` as "not provided by this
+    source", not as "definitely zero / definitely empty".
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    timestamp: datetime           # UTC
+    title: str
+    source: str                   # domain or publication
+    url: str
+    tone: Decimal | None = None   # GDELT scale: roughly -100..+100
+    themes: tuple[str, ...] = ()
+    entities: tuple[str, ...] = ()
+
+    @field_validator("timestamp")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
 
 
 class Granularity(StrEnum):

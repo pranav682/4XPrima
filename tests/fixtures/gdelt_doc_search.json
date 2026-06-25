@@ -1,0 +1,54 @@
+{
+  "articles": [
+    {
+      "url": "https://example.com/oil-prices-rise-2026-06-24",
+      "url_mobile": "",
+      "title": "Oil prices rise on supply concerns",
+      "seendate": "20260624T080000Z",
+      "socialimage": "https://example.com/img/1.jpg",
+      "domain": "example.com",
+      "language": "English",
+      "sourcecountry": "United States"
+    },
+    {
+      "url": "https://syndicate.example.org/wire/oil-prices-rise-2026-06-24",
+      "url_mobile": "",
+      "title": "Oil prices rise on supply concerns",
+      "seendate": "20260624T080500Z",
+      "socialimage": "",
+      "domain": "syndicate.example.org",
+      "language": "English",
+      "sourcecountry": "United States"
+    },
+    {
+      "url": "https://example.com/oil-prices-rise-2026-06-24",
+      "url_mobile": "",
+      "title": "Oil prices rise on supply concerns (duplicate)",
+      "seendate": "20260624T081000Z",
+      "socialimage": "",
+      "domain": "example.com",
+      "language": "English",
+      "sourcecountry": "United States"
+    },
+    {
+      "url": "https://another-news.example/eurusd-outlook",
+      "url_mobile": "",
+      "title": "EUR/USD outlook ahead of ECB",
+      "seendate": "20260624T093000Z",
+      "socialimage": "",
+      "domain": "another-news.example",
+      "language": "English",
+      "sourcecountry": "United Kingdom",
+      "tone": "-2.5"
+    },
+    {
+      "url": "https://no-title.example/missing",
+      "url_mobile": "",
+      "title": "",
+      "seendate": "20260624T100000Z",
+      "domain": "no-title.example",
+      "language": "English",
+      "sourcecountry": "United States"
+    }
+  ]
+}

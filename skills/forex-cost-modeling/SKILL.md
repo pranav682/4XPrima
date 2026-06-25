@@ -9,6 +9,8 @@ description: Models the real-world cost of a forex trade — spread, slippage, c
 
 Any backtest, any parameter sweep, any cost-sensitivity check. Costs that don't model these factors will systematically over-state edge.
 
+> **Signal vs fill convention.** Strategies may signal on mid prices (cleaner indicators, no spread-induced noise), but every signal must be validated against realistic fill costs — the gap between mid and the broker's actual closeout side is real money. The backtester enforces this in Stage 2 by feeding strategies the mid stream but executing simulated fills against bid/ask + cost model.
+
 ## The method
 
 A simulated fill on instrument `i` at time `t` costs the strategy:

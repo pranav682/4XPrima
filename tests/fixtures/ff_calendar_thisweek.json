@@ -1,0 +1,51 @@
+[
+  {
+    "title": "Tentative Speech",
+    "country": "EUR",
+    "date": "2026-06-22T05:00:00-04:00",
+    "impact": "Low",
+    "forecast": "",
+    "previous": ""
+  },
+  {
+    "title": "CPI m/m",
+    "country": "CAD",
+    "date": "2026-06-22T08:30:00-04:00",
+    "impact": "High",
+    "forecast": "0.7%",
+    "previous": "0.4%",
+    "actual": "0.8%"
+  },
+  {
+    "title": "Flash Manufacturing PMI",
+    "country": "USD",
+    "date": "2026-06-23T09:45:00-04:00",
+    "impact": "Medium",
+    "forecast": "54.6",
+    "previous": "55.3"
+  },
+  {
+    "title": "Employment Change",
+    "country": "AUD",
+    "date": "2026-06-24T21:30:00-04:00",
+    "impact": "High",
+    "forecast": "31.2K",
+    "previous": "-18.6K"
+  },
+  {
+    "title": "Bank Holiday",
+    "country": "JPY",
+    "date": "2026-06-25T00:00:00-04:00",
+    "impact": "Holiday",
+    "forecast": "",
+    "previous": ""
+  },
+  {
+    "title": "Retail Sales m/m",
+    "country": "USD",
+    "date": "2026-06-26T08:30:00-04:00",
+    "impact": "High",
+    "forecast": "0.3%",
+    "previous": "0.4%"
+  }
+]

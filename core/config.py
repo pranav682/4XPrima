@@ -70,3 +70,29 @@ class OandaSettings(BaseSettings):
     @property
     def base_url(self) -> str:
         return _BASE_URLS[self.env]
+
+
+class FredSettings(BaseSettings):
+    """FRED (Federal Reserve Economic Data) API credentials.
+
+    Free key from https://fredaccount.stlouisfed.org/apikey. Loaded from
+    `FRED_API_KEY` in env / .env. Wrapped in :class:`SecretStr` so it
+    stays out of repr / log output.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_prefix="FRED_",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    api_key: SecretStr = Field(
+        ...,
+        description="FRED API key. SecretStr so it never lands in repr or logs.",
+    )
+
+    @property
+    def base_url(self) -> str:
+        return "https://api.stlouisfed.org"
