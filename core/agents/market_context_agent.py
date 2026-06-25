@@ -10,12 +10,11 @@ What this agent does:
    compact :class:`MarketContextBrief` — upcoming/recent material events
    with computed surprises, a small named-FRED-series snapshot, and the
    deduped recent headlines.
-2. **LLM step.** The brief is the *volatile tail*; the agent's instructions
-   and the format spec are the *stable cached prefix*. Runs on the Sonnet
-   tier (good perf/cost balance, 1k cache minimum makes the prefix worth
-   caching). Output is forced into the
-   :class:`core.models.MarketContextReport` schema by the LLM client's
-   structured-output mechanism.
+2. **LLM step.** The brief is the *volatile user message*; the agent's
+   instructions and the format spec are the *stable system prefix* (~auto-
+   cached by OpenAI once it crosses ~1024 tokens). Runs on the DEFAULT tier
+   (``gpt-5.4``). Output is forced into
+   :class:`core.models.MarketContextReport` via OpenAI Structured Outputs.
 
 What this agent does NOT do:
 
@@ -28,6 +27,7 @@ What this agent does NOT do:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -40,12 +40,9 @@ from core.context_data import (
     NewsProvider,
 )
 from core.llm_client import (
-    AgentRequest,
     AgentResponse,
-    ContextManagementConfig,
-    LLMClient,
+    LLMProvider,
     ModelTier,
-    StableBlock,
 )
 from core.models import (
     EconomicEvent,
@@ -65,8 +62,8 @@ class MarketContextRequest:
 
     run_id: str
     as_of: datetime                                  # UTC
-    watchlist: tuple[str, ...]                        # e.g. ("EURUSD", "USDJPY")
-    upcoming_hours: int = 168                         # 7 days
+    watchlist: tuple[str, ...]                       # e.g. ("EURUSD", "USDJPY")
+    upcoming_hours: int = 168                        # 7 days
     recent_hours: int = 24
     macro_series_names: tuple[str, ...] = (
         "US_CPI",
@@ -98,17 +95,16 @@ class MacroSnapshot:
     name: str
     series_id: str
     latest_date: str | None
-    latest_value: str | None    # rendered as string; None when missing
+    latest_value: str | None
     previous_value: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class MarketContextBrief:
-    """The volatile payload handed to the LLM as the final user message.
+    """The volatile payload handed to the LLM as the user message.
 
-    Compact and shape-stable: a JSON-serialisable summary of upcoming /
-    recent events, a small macro snapshot, and headline rows. The LLM does
-    NOT see raw provider data — only this brief.
+    Compact and shape-stable. The LLM does NOT see raw provider data —
+    only this brief.
     """
 
     run_id: str
@@ -171,40 +167,38 @@ class MarketContextBrief:
 
 
 # ---------------------------------------------------------------------------
-# Stable prompt — the cacheable system prefix
+# Stable system prefix — byte-identical across calls so OpenAI auto-caches it.
 # ---------------------------------------------------------------------------
 
-# Kept as module constants so they're byte-identical across calls (a churn
-# of even whitespace would invalidate the prompt cache). Keep these compact;
-# they live in every call.
+# Kept as a module constant so accidental whitespace churn can't break the
+# cache. The prefix is intentionally long (instructions + schema notes) so it
+# crosses OpenAI's ~1024-token automatic-caching threshold — see
+# docs/llm-conventions.md §2.
 
-_AGENT_INSTRUCTIONS = """\
+_STABLE_SYSTEM = """\
 You are market_context_agent, a deterministic distiller of macro and \
 microstructure context for an algorithmic FX trading system.
 
 Your job: read the deterministic BRIEF in the user message and emit a single \
-structured MarketContextReport via the submit_structured_output tool.
+MarketContextReport via the structured-output schema. Cite numbers and \
+events from the brief; do not invent.
 
 Hard rules:
 
-- You may not recommend trades. No "buy", "sell", "go long/short", "long bias", \
-"target", "stop loss", or any imperative trade language anywhere in your output. \
-Describe regimes, surprises, sentiment, and risk flags neutrally.
-- All claims must trace to data in the brief. Do not invent numbers, events, or \
-headlines. If the brief lacks evidence for a claim, omit it.
-- GDELT's dictionary tone is NOT available to you here; derive sentiment from \
-the HEADLINE TEXT in the brief.
-- Be specific: regime tags per pair, surprise reads per release, sentiment reads \
-per currency, named risk flags.
-- Confidence per regime and the overall confidence reflect how much the brief \
-actually supports your call — low-evidence calls get low confidence, not a \
-high-confidence guess.
+- You may NOT recommend trades. No "buy", "sell", "go long", "go short", \
+"long bias", "short bias", "target price", "stop loss", "take profit", or \
+any imperative trade language anywhere in your output. Describe regimes, \
+surprises, sentiment, and risk flags neutrally.
+- All claims must trace to data in the brief. If the brief lacks evidence \
+for a claim, omit it.
+- GDELT's dictionary tone is NOT ingested into the brief. Derive sentiment \
+from the HEADLINE TEXT itself.
+- Be specific: regime tags per pair, surprise reads per release, sentiment \
+reads per currency, named risk flags.
+- Confidence (per regime and overall) reflects how much the brief actually \
+supports your call. Low evidence → low confidence, not a confident guess.
 
-The submit_structured_output tool input MUST match the MarketContextReport schema.\
-"""
-
-_OUTPUT_SCHEMA_NOTE = """\
-The MarketContextReport schema has these top-level fields:
+OUTPUT SCHEMA (MarketContextReport):
 
 - run_id (string): copy from the brief.
 - as_of (ISO-8601 UTC datetime): copy from the brief.
@@ -215,33 +209,105 @@ confidence in [0,1], rationale).
   - trend_state: trending_up | trending_down | mean_reverting | range_tight | \
 range_wide | event_driven | unknown.
   - vol_state: low | normal | elevated | high | unknown.
-- key_scheduled_events: list of ScheduledEventSummary(when, currency, name, impact).
-  - impact: high | medium | low | holiday | unknown.
+- key_scheduled_events: list of ScheduledEventSummary(when, currency, name, \
+impact). impact: high | medium | low | holiday | unknown.
 - notable_surprises: list of NotableSurprise(when, currency, name, actual, \
 forecast, surprise, significance). Include only releases with a meaningful \
 surprise; cite numbers from the brief.
-- sentiment: list of SentimentRead(currency, label, score in [-1,1], rationale).
-  - label: positive | neutral | negative | mixed.
-- risk_flags: list of RiskFlagOut(code, severity, description).
-  - severity: info | warn | alert.
-  - codes use a stable taxonomy, e.g. FOMC_T+18h, NFP_T+4d, thin_liquidity_window, \
-low_regime_confidence:<pair>.
+- sentiment: list of SentimentRead(currency, label, score in [-1,1], \
+rationale). label: positive | neutral | negative | mixed.
+- risk_flags: list of RiskFlagOut(code, severity, description). severity: \
+info | warn | alert. Use a stable code taxonomy (e.g. FOMC_T+18h, NFP_T+4d, \
+thin_liquidity_window, low_regime_confidence:<pair>).
 - notes (≤1000 chars): neutral commentary. No trade calls.
 - confidence in [0,1]: overall confidence in the report.
 
-Currency codes must be ISO-4217 three letters (USD, EUR, GBP, JPY, ...). Pair \
-codes must be six letters with no separator (EURUSD, USDJPY, ...).\
+Currency codes are ISO-4217 three letters (USD, EUR, GBP, JPY, ...). Pair \
+codes are six letters with no separator (EURUSD, USDJPY, ...).
+
+Restate (this is the rule, not advice): you are NOT a strategy. You describe \
+context. The strategy lab and critic come later in the pipeline.
+
+REGIME RUBRIC (how to choose tags):
+
+- risk_state = risk_on when equity / EM / commodity-FX show coordinated \
+strength and safe havens (USD/JPY/CHF) are softer; risk_off the mirror image; \
+neutral when no coordinated move is visible; unknown when the brief lacks \
+the evidence to support either.
+- trend_state = trending_up / trending_down when the brief or recent \
+surprises clearly tilt the pair's direction over the lookback; mean_reverting \
+when prior moves are being undone; range_tight when realised vol is at the \
+low end of recent regime; range_wide when high; event_driven when one \
+scheduled release dominates near-term price discovery; unknown when the brief \
+is too thin to choose.
+- vol_state = low / normal / elevated / high relative to the pair's own \
+recent norms — not absolute. A spread-widening pre-news window is elevated, \
+not high.
+
+RISK-FLAG TAXONOMY (codes are stable and machine-parseable):
+
+- FOMC_T+<hours> / ECB_T+<hours> / BOJ_T+<hours> / BOE_T+<hours> — a tier-1 \
+central-bank decision or speech in the near future.
+- NFP_T+<days> / CPI_T+<days> — a tier-1 data release imminent.
+- thin_liquidity_window — Asia open Sunday, US holiday, year-end illiquidity.
+- gap_risk_weekend — a position carrying weekend gap exposure.
+- low_regime_confidence:<pair> — confidence < 0.4 for that pair's regime.
+- stale_macro:<series> — the most recent FRED observation is older than 60 \
+days (releases lag).
+
+SENTIMENT LABEL SEMANTICS:
+
+- positive: headlines tilt the currency stronger (hawkish CB, beat-data, \
+growth optimism, safe-haven inflow when applicable).
+- negative: the mirror — softer-data, dovish CB, capital outflow risk.
+- mixed: meaningful headlines on both sides with no dominant signal.
+- neutral: thin or balanced coverage, no actionable read.
+The score is intensity, not direction (label carries the sign). +0.8 = strong \
+positive coverage; -0.4 = mildly negative. Use small magnitudes when evidence \
+is thin.
+
+OUTPUT EXAMPLE (shape, NOT content — copy structure, not values):
+
+{
+  "run_id": "<from brief>",
+  "as_of": "<from brief, ISO-8601 Z>",
+  "schema_version": "1.0",
+  "regimes": [
+    {
+      "pair": "EURUSD",
+      "risk_state": "risk_off",
+      "trend_state": "trending_down",
+      "vol_state": "elevated",
+      "confidence": 0.62,
+      "rationale": "Softer EZ data and firmer US yields in the brief."
+    }
+  ],
+  "key_scheduled_events": [
+    {"when": "<ISO-8601 Z>", "currency": "USD", "name": "FOMC Statement", \
+"impact": "high"}
+  ],
+  "notable_surprises": [
+    {"when": "<ISO-8601 Z>", "currency": "USD", "name": "Flash PMI", \
+"actual": "55.0", "forecast": "54.0", "surprise": "1.0", \
+"significance": "Mildly positive print; coverage notes broad services strength."}
+  ],
+  "sentiment": [
+    {"currency": "USD", "label": "positive", "score": 0.3, \
+"rationale": "Hawkish coverage dominates this morning's headlines."}
+  ],
+  "risk_flags": [
+    {"code": "FOMC_T+24h", "severity": "warn", "description": "FOMC speakers \
+tomorrow; expect wider spreads in the news window."}
+  ],
+  "notes": "USD firmer across the board; EUR softer on growth read. EM \
+mixed.",
+  "confidence": 0.55
+}
+
+Note the absence of "buy", "sell", "go long", "target", or any imperative — \
+this is a description, not a trade. If you feel an urge to recommend, you are \
+in the wrong agent.\
 """
-
-_STABLE_BLOCKS: tuple[StableBlock, ...] = (
-    StableBlock(kind="spec", name="agent_instructions", text=_AGENT_INSTRUCTIONS),
-    StableBlock(kind="schema", name="output_schema_note", text=_OUTPUT_SCHEMA_NOTE),
-)
-
-
-# Impact filtering helpers — shared between brief assembly and tests.
-
-_HIGH_OR_TIER1 = frozenset({ImpactLevel.HIGH})
 
 
 # ---------------------------------------------------------------------------
@@ -252,20 +318,20 @@ _HIGH_OR_TIER1 = frozenset({ImpactLevel.HIGH})
 class MarketContextAgent:
     """Builds a brief from deterministic sources and asks the LLM to interpret it.
 
-    Constructor takes the LLM client and the three data providers. The agent
-    only ever reads — it never places orders or proposes strategies.
+    Constructor takes the LLM provider and the three data providers. The
+    agent only ever reads — it never places orders or proposes strategies.
     """
 
     def __init__(
         self,
         *,
-        llm_client: LLMClient,
+        llm_provider: LLMProvider,
         calendar_provider: EconomicCalendarProvider,
         macro_provider: MacroDataProvider,
         news_provider: NewsProvider,
-        tier: ModelTier = ModelTier.SONNET,
+        tier: ModelTier = ModelTier.DEFAULT,
     ) -> None:
-        self._llm = llm_client
+        self._llm = llm_provider
         self._calendar = calendar_provider
         self._macro = macro_provider
         self._news = news_provider
@@ -282,8 +348,8 @@ class MarketContextAgent:
             timedelta(hours=request.recent_hours),
             min_impact=ImpactLevel.MEDIUM,
         )
-        # Only releases whose `actual` is in and whose forecast was numeric
-        # qualify as "surprises" — surprise is None otherwise.
+        # Only releases whose `actual` and `forecast` are both numeric have
+        # a numeric `surprise` — that's what qualifies for the surprise list.
         recent_surprises = tuple(e for e in recent if e.surprise is not None)
 
         macro = tuple(self._fetch_macro(request))
@@ -303,14 +369,11 @@ class MarketContextAgent:
         for name in request.macro_series_names:
             series_id = FRED_SERIES.get(name)
             if series_id is None:
-                # Unknown name — skip rather than fail the whole brief.
                 continue
             try:
                 points = self._macro.get_series(series_id)
             except Exception:
                 # Provider error in one series shouldn't kill the whole brief.
-                # The provider already logs the failure; we surface a blank
-                # snapshot and let the agent reason on what's left.
                 yield MacroSnapshot(
                     name=name,
                     series_id=series_id,
@@ -357,33 +420,20 @@ class MarketContextAgent:
         from the providers, and so other agents (or replay) can reuse the
         same prompt assembly without re-fetching.
         """
-        user_message = {
-            "role": "user",
-            "content": (
-                "Distil the following deterministic brief into a "
-                "MarketContextReport. Use the submit_structured_output tool. "
-                "Cite numbers from the brief; do not invent.\n\n"
-                f"BRIEF:\n{_pretty(brief.to_json())}"
-            ),
-        }
-        ctx_mgmt = ContextManagementConfig(
-            enable_compaction=False,  # one-shot structured call; no long history
-            enable_clear_thinking=False,
-            enable_clear_tool_uses=False,
+        volatile_user = (
+            "Distil the following deterministic brief into a "
+            "MarketContextReport. Cite numbers from the brief; do not invent.\n\n"
+            f"BRIEF:\n{_pretty(brief.to_json())}"
         )
-        ag_request = AgentRequest(
+        return self._llm.generate_structured(
             agent_name="market_context_agent",
             run_id=brief.run_id,
             tier=self._tier,
-            tools=(),
-            stable_system_blocks=_STABLE_BLOCKS,
-            volatile_policy=None,
-            messages=(user_message,),
+            stable_system=_STABLE_SYSTEM,
+            volatile_user=volatile_user,
+            output_model=MarketContextReport,
             max_output_tokens=4096,
-            context_management=ctx_mgmt,
-            cache_ttl="5m",
         )
-        return self._llm.call_structured(ag_request, output_model=MarketContextReport)
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +444,7 @@ class MarketContextAgent:
 def _pick_material(
     events: Iterable[EconomicEvent], watchlist: Iterable[str]
 ) -> tuple[EconomicEvent, ...]:
-    """Keep tier-1 (HIGH) events on watchlist currencies; for non-watchlist
+    """Keep HIGH + MEDIUM events on watchlist currencies; for non-watchlist
     currencies keep only HIGH-impact releases that affect majors broadly."""
     wl_currencies = {ccy for pair in watchlist for ccy in (pair[:3], pair[3:])}
     out: list[EconomicEvent] = []
@@ -432,9 +482,7 @@ def _summarise_series(
 
 
 def _pretty(obj: dict[str, Any]) -> str:
-    """Pretty-stable JSON serialisation for the brief — sorted keys, compact."""
-    import json
-
+    """Deterministic compact JSON for the brief — sorted keys."""
     return json.dumps(obj, sort_keys=True, separators=(",", ": "))
 
 

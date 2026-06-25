@@ -208,7 +208,7 @@ def test_brief_assembly_filters_to_material_events(
 ) -> None:
     llm = MagicMock()
     agent = MarketContextAgent(
-        llm_client=llm,
+        llm_provider=llm,
         calendar_provider=make_calendar(upcoming_events, recent_events),
         macro_provider=make_macro(macro_series_data),
         news_provider=make_news(headlines),
@@ -238,7 +238,7 @@ def test_brief_macro_snapshot_picks_two_latest_non_missing(
 ) -> None:
     llm = MagicMock()
     agent = MarketContextAgent(
-        llm_client=llm,
+        llm_provider=llm,
         calendar_provider=make_calendar(upcoming_events, recent_events),
         macro_provider=make_macro(macro_series_data),
         news_provider=make_news(headlines),
@@ -266,7 +266,7 @@ def test_brief_assembly_survives_provider_exceptions(
     news = MagicMock()
     news.search.side_effect = RuntimeError("simulated outage")
     agent = MarketContextAgent(
-        llm_client=llm,
+        llm_provider=llm,
         calendar_provider=make_calendar(upcoming_events, recent_events),
         macro_provider=macro,
         news_provider=news,
@@ -286,7 +286,7 @@ def test_brief_to_json_is_deterministic(
 ) -> None:
     llm = MagicMock()
     agent = MarketContextAgent(
-        llm_client=llm,
+        llm_provider=llm,
         calendar_provider=make_calendar(upcoming_events, recent_events),
         macro_provider=make_macro(macro_series_data),
         news_provider=make_news(headlines),
@@ -302,25 +302,27 @@ def test_brief_to_json_is_deterministic(
 # ---------------------------------------------------------------------------
 
 
-def test_run_calls_llm_with_sonnet_tier_and_returns_parsed_report(
+def test_run_calls_llm_with_default_tier_and_returns_parsed_report(
     now, upcoming_events, recent_events, macro_series_data, headlines
 ) -> None:
+    """The agent dispatches via the provider-agnostic generate_structured
+    API on the DEFAULT tier, with the stable system prefix and the
+    volatile brief as the user message."""
     canned = make_report(now)
     llm = MagicMock()
-    llm.call_structured.return_value = (
+    llm.generate_structured.return_value = (
         canned,
         AgentResponse(
             agent_name="market_context_agent",
             run_id="r1",
-            model="claude-sonnet-4-6",
-            tier=ModelTier.SONNET,
-            stop_reason="end_turn",
-            usage=TokenUsage(50, 0, 200, 80),
-            betas_sent=("context-management-2025-06-27",),
+            tier=ModelTier.DEFAULT,
+            model="gpt-5.4",
+            finish_reason="stop",
+            usage=TokenUsage(prompt_tokens=1500, cached_tokens=900, completion_tokens=80),
         ),
     )
     agent = MarketContextAgent(
-        llm_client=llm,
+        llm_provider=llm,
         calendar_provider=make_calendar(upcoming_events, recent_events),
         macro_provider=make_macro(macro_series_data),
         news_provider=make_news(headlines),
@@ -331,16 +333,20 @@ def test_run_calls_llm_with_sonnet_tier_and_returns_parsed_report(
         )
     )
 
-    llm.call_structured.assert_called_once()
-    ag_request = llm.call_structured.call_args.args[0]
-    assert ag_request.tier == ModelTier.SONNET
-    assert ag_request.agent_name == "market_context_agent"
-    assert len(ag_request.stable_system_blocks) >= 2  # spec + schema note
-    # Volatile data lives in the user message, NOT in stable blocks.
-    assert any(m["role"] == "user" for m in ag_request.messages)
+    llm.generate_structured.assert_called_once()
+    kwargs = llm.generate_structured.call_args.kwargs
+    assert kwargs["tier"] == ModelTier.DEFAULT
+    assert kwargs["agent_name"] == "market_context_agent"
+    assert kwargs["output_model"] is MarketContextReport
+    # The stable system prefix is large enough to cross the OpenAI cache
+    # threshold (verified separately) — assert presence here.
+    assert "market_context_agent" in kwargs["stable_system"]
+    # Volatile brief carries the BRIEF tag and the run_id.
+    assert "BRIEF" in kwargs["volatile_user"]
+    assert "r1" in kwargs["volatile_user"]
 
     assert report is canned
-    assert meta.tier == ModelTier.SONNET
+    assert meta.tier == ModelTier.DEFAULT
 
 
 def test_report_must_not_contain_trade_calls() -> None:
@@ -393,9 +399,11 @@ def test_malformed_llm_output_propagates_as_validation_error(
     from core.llm_client import LlmClientError
 
     llm = MagicMock()
-    llm.call_structured.side_effect = LlmClientError("model output failed schema validation")
+    llm.generate_structured.side_effect = LlmClientError(
+        "model output failed schema validation"
+    )
     agent = MarketContextAgent(
-        llm_client=llm,
+        llm_provider=llm,
         calendar_provider=make_calendar(upcoming_events, recent_events),
         macro_provider=make_macro(macro_series_data),
         news_provider=make_news(headlines),

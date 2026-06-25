@@ -72,28 +72,28 @@ class OandaSettings(BaseSettings):
         return _BASE_URLS[self.env]
 
 
-class AnthropicSettings(BaseSettings):
-    """Anthropic API credentials.
+class OpenAISettings(BaseSettings):
+    """OpenAI API credentials.
 
-    `ANTHROPIC_API_KEY` is wrapped in :class:`SecretStr` so it stays out of
-    repr / log output. `ANTHROPIC_BETA_HEADERS` is read but not used as a
-    default — `core.llm_client` resolves the beta header set per CALL based
-    on the chosen model's capabilities, not a global default. The env var
-    only documents the union of betas this project may opt into.
+    ``OPENAI_API_KEY`` is wrapped in :class:`SecretStr` so it stays out of
+    repr / log output. ``OPENAI_PROJECT`` and ``OPENAI_ORG`` are optional —
+    set them when calling under a specific project / org pinning.
     """
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        env_prefix="ANTHROPIC_",
+        env_prefix="OPENAI_",
         extra="ignore",
         case_sensitive=False,
     )
 
     api_key: SecretStr = Field(
         ...,
-        description="Anthropic API key. SecretStr keeps it out of repr / logs.",
+        description="OpenAI API key. SecretStr keeps it out of repr / logs.",
     )
+    project: str | None = Field(default=None, description="Optional project ID.")
+    org: str | None = Field(default=None, description="Optional organization ID.")
 
 
 class FredSettings(BaseSettings):

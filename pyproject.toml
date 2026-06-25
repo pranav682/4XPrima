@@ -12,10 +12,10 @@ license = { text = "Proprietary" }
 authors = [{ name = "4xPrima" }]
 dependencies = [
     # --- LLM ---
-    # Direct SDK is the only currently-required runtime path; the Agent SDK is
-    # listed as a candidate in docs/llm-conventions.md — promote to a hard dep
-    # if/when we adopt it.
-    "anthropic>=0.40.0",
+    # OpenAI is the active runtime provider; structured outputs via
+    # client.chat.completions.parse() require the 2.x SDK series. The LLM
+    # client interface is provider-agnostic — see core/llm_client.py.
+    "openai>=2.0.0",
     # --- Config & data ---
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
@@ -36,9 +36,6 @@ dev = [
     "mypy>=1.10",
 ]
 # Candidates under evaluation — install only when adopted.
-agent-sdk = [
-    "claude-agent-sdk>=0.1",
-]
 multi-provider = [
     # litellm is a candidate adapter if we ever need provider portability.
     # NOT used by default — runtime LLM calls go through core/llm_client.py.

@@ -1,8 +1,15 @@
-"""Tests for core/llm_client.py — fully hermetic (mocked SDK).
+"""Tests for core/llm_client.py — fully hermetic (mocked OpenAI SDK).
 
-These tests verify the conventions and the tier-aware capability guard the
-user flagged: a Haiku call must NEVER carry the `compact-2026-01-12` beta,
-even when the caller requested compaction.
+We verify:
+
+- Tier → model mapping is pinned and correct.
+- Stable system / volatile user message structure is what reaches the SDK.
+- Structured outputs flow: the SDK's pydantic instance is returned.
+- Token accounting captures prompt / cached / completion correctly.
+- Schema-validation failure / refusal / missing parsed → LlmClientError.
+- The API key never appears in error messages.
+- Live smokes (cheap nano + DEFAULT-tier caching check) are gated on
+  RUN_LIVE_TESTS=1 + OPENAI_API_KEY; skipped in CI.
 """
 
 from __future__ import annotations
@@ -12,27 +19,21 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
 
+import openai
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from core.config import AnthropicSettings
+from core.config import OpenAISettings
 from core.llm_client import (
-    COMPACTION_BETA,
-    CONTEXT_MANAGEMENT_BETA,
-    MODEL_HAIKU,
-    MODEL_OPUS,
-    MODEL_SONNET,
-    STRUCTURED_OUTPUT_TOOL_NAME,
-    AgentRequest,
-    ContextManagementConfig,
-    LLMClient,
+    MODEL_CHEAP,
+    MODEL_DEFAULT,
+    MODEL_HEAVY,
+    AgentResponse,
     LlmClientError,
     ModelTier,
-    StableBlock,
+    OpenAIProvider,
     TokenUsage,
-    build_system_blocks,
-    resolve_context_management,
-    tier_supports_compaction,
+    model_for_tier,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,387 +51,353 @@ class TinyReport(BaseModel):
 
 
 @dataclass
-class FakeToolUseBlock:
-    """Mimics the anthropic SDK's tool_use content block."""
-
-    type: str
-    name: str
-    input: dict[str, Any]
-    id: str = "blk_1"
+class FakePromptTokensDetails:
+    cached_tokens: int = 0
 
 
 @dataclass
 class FakeUsage:
-    input_tokens: int = 50
-    cache_read_input_tokens: int = 0
-    cache_creation_input_tokens: int = 200
-    output_tokens: int = 80
+    prompt_tokens: int = 1500
+    completion_tokens: int = 60
+    prompt_tokens_details: FakePromptTokensDetails = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.prompt_tokens_details is None:
+            self.prompt_tokens_details = FakePromptTokensDetails()
 
 
 @dataclass
-class FakeResponse:
-    content: list[Any]
+class FakeMessage:
+    parsed: Any
+    refusal: str | None = None
+
+
+@dataclass
+class FakeChoice:
+    message: FakeMessage
+    finish_reason: str = "stop"
+
+
+@dataclass
+class FakeCompletion:
+    choices: list[FakeChoice]
     usage: FakeUsage
-    stop_reason: str = "end_turn"
-    context_management: Any = None
 
 
-def _ok_response(payload: dict[str, Any] | None = None) -> FakeResponse:
-    payload = payload or {"title": "ok", "score": 0.5}
-    block = FakeToolUseBlock(
-        type="tool_use", name=STRUCTURED_OUTPUT_TOOL_NAME, input=payload
+def _ok_completion(
+    parsed: TinyReport | None = None,
+    *,
+    cached_tokens: int = 0,
+) -> FakeCompletion:
+    parsed = parsed if parsed is not None else TinyReport(title="ok", score=0.5)
+    return FakeCompletion(
+        choices=[FakeChoice(message=FakeMessage(parsed=parsed))],
+        usage=FakeUsage(
+            prompt_tokens_details=FakePromptTokensDetails(cached_tokens=cached_tokens)
+        ),
     )
-    return FakeResponse(content=[block], usage=FakeUsage())
 
 
-def _make_client(
+def _make_provider(
     sdk: MagicMock | None = None, recorder: MagicMock | None = None
-) -> tuple[LLMClient, MagicMock, MagicMock]:
+) -> tuple[OpenAIProvider, MagicMock, MagicMock]:
     sdk = sdk or MagicMock()
     recorder = recorder or MagicMock()
-    settings = AnthropicSettings(api_key=SecretStr("test-key-not-real"))
-    client = LLMClient(settings, usage_recorder=recorder, anthropic_client=sdk)
-    return client, sdk, recorder
+    settings = OpenAISettings(api_key=SecretStr("test-key-not-real"))
+    provider = OpenAIProvider(
+        settings, openai_client=sdk, usage_recorder=recorder
+    )
+    return provider, sdk, recorder
 
 
-def _basic_request(
-    tier: ModelTier = ModelTier.SONNET,
-    ctx_mgmt: ContextManagementConfig | None = None,
-) -> AgentRequest:
-    return AgentRequest(
+def _call(
+    provider: OpenAIProvider,
+    tier: ModelTier = ModelTier.DEFAULT,
+    stable: str = "STABLE INSTRUCTIONS — pretend this is long and identical across calls.",
+    volatile: str = "VOLATILE DATA for this call.",
+) -> tuple[TinyReport, AgentResponse]:
+    return provider.generate_structured(
         agent_name="t",
         run_id="r1",
         tier=tier,
-        stable_system_blocks=(
-            StableBlock(kind="spec", name="agent_spec", text="instructions go here..."),
-            StableBlock(kind="skill", name="format", text="schema notes..."),
-        ),
-        messages=({"role": "user", "content": "go"},),
-        context_management=ctx_mgmt,
+        stable_system=stable,
+        volatile_user=volatile,
+        output_model=TinyReport,
     )
 
 
 # ---------------------------------------------------------------------------
-# Pure helpers
+# Pure constants
 # ---------------------------------------------------------------------------
 
 
 def test_tier_to_model_mapping_is_pinned() -> None:
-    # Pinned values — bumping these is a deliberate change that resets caches.
-    assert MODEL_HAIKU == "claude-haiku-4-5-20251001"
-    assert MODEL_SONNET == "claude-sonnet-4-6"
-    assert MODEL_OPUS == "claude-opus-4-8"
-
-
-def test_tier_supports_compaction_matrix() -> None:
-    """The user's flagged guard — verified against current docs.claude.com."""
-    assert tier_supports_compaction(ModelTier.HAIKU) is False
-    assert tier_supports_compaction(ModelTier.SONNET) is True
-    assert tier_supports_compaction(ModelTier.OPUS) is True
-
-
-def test_build_system_blocks_puts_cache_control_on_last_stable() -> None:
-    blocks = (
-        StableBlock(kind="spec", name="a", text="A"),
-        StableBlock(kind="skill", name="b", text="B"),
-        StableBlock(kind="skill", name="c", text="C"),
-    )
-    out = build_system_blocks(blocks, volatile_policy=None, cache_ttl="5m")
-    assert len(out) == 3
-    assert "cache_control" not in out[0]
-    assert "cache_control" not in out[1]
-    assert out[2]["cache_control"] == {"type": "ephemeral"}
-
-
-def test_build_system_blocks_volatile_policy_is_after_breakpoint() -> None:
-    from core.llm_client import VolatilePolicy
-
-    blocks = (StableBlock(kind="spec", name="a", text="A"),)
-    out = build_system_blocks(
-        blocks, volatile_policy=VolatilePolicy(text="dynamic"), cache_ttl="5m"
-    )
-    # Stable block has cache_control; volatile (appended after) does NOT.
-    assert out[0]["cache_control"] == {"type": "ephemeral"}
-    assert "cache_control" not in out[1]
-    assert out[1]["text"] == "dynamic"
-
-
-def test_build_system_blocks_empty_rejects() -> None:
-    with pytest.raises(ValueError, match="cache the agent spec"):
-        build_system_blocks((), volatile_policy=None, cache_ttl="5m")
-
-
-def test_resolve_context_management_haiku_drops_compaction() -> None:
-    """THE GUARD: Haiku call with enable_compaction=True must drop both the
-    edit AND the compaction beta header."""
-    body, betas = resolve_context_management(
-        ContextManagementConfig(enable_compaction=True), ModelTier.HAIKU
-    )
-    types = [e["type"] for e in body["edits"]]
-    assert "compact_20260112" not in types
-    assert COMPACTION_BETA not in betas
-    # Clear edits still apply on Haiku.
-    assert "clear_thinking_20251015" in types
-    assert "clear_tool_uses_20250919" in types
-    assert CONTEXT_MANAGEMENT_BETA in betas
-
-
-def test_resolve_context_management_sonnet_keeps_compaction() -> None:
-    body, betas = resolve_context_management(
-        ContextManagementConfig(enable_compaction=True), ModelTier.SONNET
-    )
-    types = [e["type"] for e in body["edits"]]
-    assert types[0] == "compact_20260112"  # compaction first per the canonical example
-    assert COMPACTION_BETA in betas
-    assert CONTEXT_MANAGEMENT_BETA in betas
-
-
-def test_resolve_context_management_opus_keeps_compaction() -> None:
-    body, betas = resolve_context_management(
-        ContextManagementConfig(enable_compaction=True), ModelTier.OPUS
-    )
-    assert any(e["type"] == "compact_20260112" for e in body["edits"])
-    assert COMPACTION_BETA in betas
-
-
-def test_resolve_context_management_none() -> None:
-    body, betas = resolve_context_management(None, ModelTier.HAIKU)
-    assert body is None
-    assert betas == []
+    # Bumping these is a deliberate change — see docs/llm-conventions.md.
+    assert MODEL_CHEAP == "gpt-5.4-nano"
+    assert MODEL_DEFAULT == "gpt-5.4"
+    assert MODEL_HEAVY == "gpt-5.5"
+    assert model_for_tier(ModelTier.CHEAP) == MODEL_CHEAP
+    assert model_for_tier(ModelTier.DEFAULT) == MODEL_DEFAULT
+    assert model_for_tier(ModelTier.HEAVY) == MODEL_HEAVY
 
 
 # ---------------------------------------------------------------------------
-# End-to-end client behaviour (mocked SDK)
+# Message structure (stable system + volatile user)
 # ---------------------------------------------------------------------------
 
 
-def test_call_structured_uses_correct_model_per_tier() -> None:
+def test_message_structure_is_system_then_user() -> None:
+    sdk = MagicMock()
+    sdk.chat.completions.parse.return_value = _ok_completion()
+    provider, _, _ = _make_provider(sdk=sdk)
+    _call(provider)
+    kwargs = sdk.chat.completions.parse.call_args.kwargs
+    msgs = kwargs["messages"]
+    assert len(msgs) == 2
+    assert msgs[0]["role"] == "system"
+    assert msgs[0]["content"].startswith("STABLE INSTRUCTIONS")
+    assert msgs[1]["role"] == "user"
+    assert msgs[1]["content"].startswith("VOLATILE DATA")
+
+
+def test_response_format_passes_the_pydantic_model() -> None:
+    sdk = MagicMock()
+    sdk.chat.completions.parse.return_value = _ok_completion()
+    provider, _, _ = _make_provider(sdk=sdk)
+    _call(provider)
+    kwargs = sdk.chat.completions.parse.call_args.kwargs
+    # The SDK's pydantic-native API takes the model class itself.
+    assert kwargs["response_format"] is TinyReport
+
+
+def test_call_uses_correct_model_per_tier() -> None:
     for tier, expected in [
-        (ModelTier.HAIKU, MODEL_HAIKU),
-        (ModelTier.SONNET, MODEL_SONNET),
-        (ModelTier.OPUS, MODEL_OPUS),
+        (ModelTier.CHEAP, MODEL_CHEAP),
+        (ModelTier.DEFAULT, MODEL_DEFAULT),
+        (ModelTier.HEAVY, MODEL_HEAVY),
     ]:
         sdk = MagicMock()
-        sdk.beta.messages.create.return_value = _ok_response()
-        client, _, _ = _make_client(sdk=sdk)
-        client.call_structured(_basic_request(tier=tier), output_model=TinyReport)
-        kwargs = sdk.beta.messages.create.call_args.kwargs
+        sdk.chat.completions.parse.return_value = _ok_completion()
+        provider, _, _ = _make_provider(sdk=sdk)
+        _call(provider, tier=tier)
+        kwargs = sdk.chat.completions.parse.call_args.kwargs
         assert kwargs["model"] == expected
 
 
-def test_call_structured_forces_tool_choice() -> None:
+def test_empty_stable_or_volatile_is_rejected() -> None:
+    provider, _, _ = _make_provider()
+    with pytest.raises(ValueError, match="stable_system"):
+        provider.generate_structured(
+            agent_name="t",
+            run_id="r1",
+            tier=ModelTier.DEFAULT,
+            stable_system="",
+            volatile_user="x",
+            output_model=TinyReport,
+        )
+    with pytest.raises(ValueError, match="volatile_user"):
+        provider.generate_structured(
+            agent_name="t",
+            run_id="r1",
+            tier=ModelTier.DEFAULT,
+            stable_system="x",
+            volatile_user="",
+            output_model=TinyReport,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Structured output parsing
+# ---------------------------------------------------------------------------
+
+
+def test_returns_parsed_pydantic_instance() -> None:
+    canned = TinyReport(title="hello", score=0.42)
     sdk = MagicMock()
-    sdk.beta.messages.create.return_value = _ok_response()
-    client, _, _ = _make_client(sdk=sdk)
-    client.call_structured(_basic_request(), output_model=TinyReport)
-    kwargs = sdk.beta.messages.create.call_args.kwargs
-    assert kwargs["tool_choice"] == {
-        "type": "tool",
-        "name": STRUCTURED_OUTPUT_TOOL_NAME,
-    }
-    # The structured-output tool is present in `tools` and is NOT deferred.
-    tool_names = [t["name"] for t in kwargs["tools"]]
-    assert STRUCTURED_OUTPUT_TOOL_NAME in tool_names
-
-
-def test_call_structured_cache_control_on_last_stable_block_in_request() -> None:
-    sdk = MagicMock()
-    sdk.beta.messages.create.return_value = _ok_response()
-    client, _, _ = _make_client(sdk=sdk)
-    client.call_structured(_basic_request(), output_model=TinyReport)
-    kwargs = sdk.beta.messages.create.call_args.kwargs
-    system = kwargs["system"]
-    assert "cache_control" not in system[0]
-    assert system[-1]["cache_control"] == {"type": "ephemeral"}
-
-
-def test_haiku_call_carries_no_compaction_beta_when_caller_asked_for_it() -> None:
-    """The required test from the user brief, asserting the guard end-to-end."""
-    sdk = MagicMock()
-    sdk.beta.messages.create.return_value = _ok_response()
-    client, _, _ = _make_client(sdk=sdk)
-    client.call_structured(
-        _basic_request(
-            tier=ModelTier.HAIKU,
-            ctx_mgmt=ContextManagementConfig(enable_compaction=True),
-        ),
-        output_model=TinyReport,
-    )
-    kwargs = sdk.beta.messages.create.call_args.kwargs
-    betas = list(kwargs.get("betas") or [])
-    assert COMPACTION_BETA not in betas, (
-        f"Haiku call leaked the compaction beta: {betas}"
-    )
-    # context-management beta still rides since clear_* edits are enabled.
-    assert CONTEXT_MANAGEMENT_BETA in betas
-    # And the context_management payload likewise lacks compact.
-    cm = kwargs.get("context_management") or {}
-    types = [e["type"] for e in cm.get("edits", [])]
-    assert "compact_20260112" not in types
-
-
-def test_sonnet_call_carries_compaction_beta_when_requested() -> None:
-    sdk = MagicMock()
-    sdk.beta.messages.create.return_value = _ok_response()
-    client, _, _ = _make_client(sdk=sdk)
-    client.call_structured(
-        _basic_request(
-            tier=ModelTier.SONNET,
-            ctx_mgmt=ContextManagementConfig(enable_compaction=True),
-        ),
-        output_model=TinyReport,
-    )
-    kwargs = sdk.beta.messages.create.call_args.kwargs
-    betas = list(kwargs.get("betas") or [])
-    assert COMPACTION_BETA in betas
-    assert CONTEXT_MANAGEMENT_BETA in betas
-
-
-def test_call_structured_parses_tool_input_into_model() -> None:
-    sdk = MagicMock()
-    sdk.beta.messages.create.return_value = _ok_response(
-        {"title": "regime check", "score": 0.7}
-    )
-    client, _, _ = _make_client(sdk=sdk)
-    parsed, meta = client.call_structured(_basic_request(), output_model=TinyReport)
+    sdk.chat.completions.parse.return_value = _ok_completion(parsed=canned)
+    provider, _, _ = _make_provider(sdk=sdk)
+    parsed, meta = _call(provider)
     assert isinstance(parsed, TinyReport)
-    assert parsed.title == "regime check"
-    assert parsed.score == 0.7
-    assert meta.model == MODEL_SONNET
-    assert meta.tier == ModelTier.SONNET
+    assert parsed.title == "hello"
+    assert parsed.score == 0.42
+    assert meta.model == MODEL_DEFAULT
+    assert meta.tier == ModelTier.DEFAULT
 
 
-def test_accounting_records_token_fields() -> None:
+def test_schema_validation_failure_at_boundary_raises() -> None:
+    """The SDK occasionally returns a parsed object via a path that
+    bypasses our strict schema — we re-validate with model_validate at the
+    boundary and surface failures as LlmClientError."""
+
+    class BypassingFake(BaseModel):
+        # Carries an extra field that TinyReport.extra='forbid' rejects.
+        model_config = ConfigDict(extra="allow")
+
+        title: str
+        score: float
+
+    # Construct a BypassingFake with extra field; model_dump preserves it,
+    # so when we round-trip through TinyReport.model_validate(...), it raises.
+    bad = BypassingFake.model_construct(title="x", score=0.5, extra_field="leak")
     sdk = MagicMock()
-    sdk.beta.messages.create.return_value = _ok_response()
-    client, _, recorder = _make_client(sdk=sdk)
-    client.call_structured(_basic_request(), output_model=TinyReport)
-    recorder.record.assert_called_once()
-    kwargs = recorder.record.call_args.kwargs
-    assert kwargs["agent_name"] == "t"
-    assert kwargs["run_id"] == "r1"
-    assert kwargs["model"] == MODEL_SONNET
-    usage: TokenUsage = kwargs["usage"]
-    assert usage.input_tokens == 50
-    assert usage.cache_creation_input_tokens == 200
-    assert usage.output_tokens == 80
-    assert kwargs["extra"].get("tier") == "sonnet"
-
-
-def test_schema_validation_failure_raises_llm_client_error() -> None:
-    sdk = MagicMock()
-    # Returned input doesn't satisfy TinyReport: score > 1.0.
-    sdk.beta.messages.create.return_value = _ok_response(
-        {"title": "x", "score": 5.0}
-    )
-    client, _, _ = _make_client(sdk=sdk)
+    sdk.chat.completions.parse.return_value = _ok_completion(parsed=bad)
+    provider, _, _ = _make_provider(sdk=sdk)
     with pytest.raises(LlmClientError, match="schema validation"):
-        client.call_structured(_basic_request(), output_model=TinyReport)
+        _call(provider)
 
 
-def test_missing_tool_use_block_raises_llm_client_error() -> None:
+def test_missing_parsed_raises() -> None:
     sdk = MagicMock()
-    sdk.beta.messages.create.return_value = FakeResponse(content=[], usage=FakeUsage())
-    client, _, _ = _make_client(sdk=sdk)
-    with pytest.raises(LlmClientError, match="did not include a tool_use"):
-        client.call_structured(_basic_request(), output_model=TinyReport)
+    sdk.chat.completions.parse.return_value = FakeCompletion(
+        choices=[FakeChoice(message=FakeMessage(parsed=None))],
+        usage=FakeUsage(),
+    )
+    provider, _, _ = _make_provider(sdk=sdk)
+    with pytest.raises(LlmClientError, match="did not include a parsed"):
+        _call(provider)
+
+
+def test_refusal_is_surfaced_as_llm_client_error() -> None:
+    sdk = MagicMock()
+    sdk.chat.completions.parse.return_value = FakeCompletion(
+        choices=[
+            FakeChoice(
+                message=FakeMessage(parsed=None, refusal="I can't help with that."),
+            )
+        ],
+        usage=FakeUsage(),
+    )
+    provider, _, _ = _make_provider(sdk=sdk)
+    with pytest.raises(LlmClientError, match="refused"):
+        _call(provider)
 
 
 def test_sdk_exception_wraps_into_llm_client_error_without_key() -> None:
-    import anthropic
-
     sdk = MagicMock()
-    sdk.beta.messages.create.side_effect = anthropic.APIError(
+    sdk.chat.completions.parse.side_effect = openai.APIError(
         message="boom", request=MagicMock(), body=None
     )
-    client, _, _ = _make_client(sdk=sdk)
+    provider, _, _ = _make_provider(sdk=sdk)
     with pytest.raises(LlmClientError) as excinfo:
-        client.call_structured(_basic_request(), output_model=TinyReport)
+        _call(provider)
     assert "test-key-not-real" not in str(excinfo.value)
 
 
-def test_anthropic_settings_repr_does_not_leak_api_key() -> None:
-    s = AnthropicSettings(api_key=SecretStr("supersecret"))
+def test_openai_settings_repr_does_not_leak_key() -> None:
+    s = OpenAISettings(api_key=SecretStr("supersecret"))
     assert "supersecret" not in repr(s)
 
 
 # ---------------------------------------------------------------------------
-# Optional live smoke
+# Token accounting
+# ---------------------------------------------------------------------------
+
+
+def test_accounting_records_prompt_cached_completion() -> None:
+    sdk = MagicMock()
+    sdk.chat.completions.parse.return_value = _ok_completion(cached_tokens=900)
+    provider, _, recorder = _make_provider(sdk=sdk)
+    _call(provider)
+    recorder.record.assert_called_once()
+    kwargs = recorder.record.call_args.kwargs
+    assert kwargs["agent_name"] == "t"
+    assert kwargs["run_id"] == "r1"
+    assert kwargs["model"] == MODEL_DEFAULT
+    usage: TokenUsage = kwargs["usage"]
+    assert usage.prompt_tokens == 1500
+    assert usage.cached_tokens == 900
+    assert usage.completion_tokens == 60
+    assert kwargs["extra"].get("tier") == "default"
+
+
+def test_cache_hit_ratio_derived_correctly() -> None:
+    usage = TokenUsage(prompt_tokens=1500, cached_tokens=900, completion_tokens=60)
+    # 900 / 1500 = 0.6
+    assert abs(usage.cache_hit_ratio - 0.6) < 1e-9
+
+
+def test_zero_prompt_tokens_gives_zero_ratio() -> None:
+    assert TokenUsage(0, 0, 0).cache_hit_ratio == 0.0
+
+
+def test_missing_prompt_tokens_details_falls_back_to_zero() -> None:
+    sdk = MagicMock()
+    # No prompt_tokens_details on the usage.
+    completion = _ok_completion()
+    completion.usage.prompt_tokens_details = None
+    sdk.chat.completions.parse.return_value = completion
+    provider, _, recorder = _make_provider(sdk=sdk)
+    _call(provider)
+    usage = recorder.record.call_args.kwargs["usage"]
+    assert usage.cached_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# Optional live smokes
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(
-    os.environ.get("RUN_LIVE_TESTS") != "1" or not os.environ.get("ANTHROPIC_API_KEY"),
-    reason="RUN_LIVE_TESTS=1 and ANTHROPIC_API_KEY must be set",
+    os.environ.get("RUN_LIVE_TESTS") != "1" or not os.environ.get("OPENAI_API_KEY"),
+    reason="RUN_LIVE_TESTS=1 and OPENAI_API_KEY must be set",
 )
-def test_live_haiku_single_call() -> None:
-    """One cheap real Haiku call confirming wiring + key + structured output."""
-    settings = AnthropicSettings()  # reads from env / .env
-    client = LLMClient(settings)
-    request = AgentRequest(
+def test_live_cheap_single_call() -> None:
+    """Cheapest real call confirming wiring + key + structured output."""
+    settings = OpenAISettings()
+    provider = OpenAIProvider(settings)
+    parsed, meta = provider.generate_structured(
         agent_name="smoke",
         run_id="live-smoke",
-        tier=ModelTier.HAIKU,
-        stable_system_blocks=(
-            StableBlock(
-                kind="spec",
-                name="haiku_spec",
-                text=(
-                    "You are a structured-output tester. Always call the "
-                    "submit_structured_output tool. Set title to 'hello' and "
-                    "score to 0.5."
-                ),
-            ),
+        tier=ModelTier.CHEAP,
+        stable_system=(
+            "You are a structured-output tester. Always emit a TinyReport "
+            "with title='hello' and score=0.5. No commentary; the structured "
+            "schema is your only output."
         ),
-        messages=({"role": "user", "content": "Confirm the wiring."},),
-        max_output_tokens=512,
+        volatile_user="Confirm the wiring.",
+        output_model=TinyReport,
+        max_output_tokens=256,
     )
-    parsed, meta = client.call_structured(request, output_model=TinyReport)
     assert isinstance(parsed, TinyReport)
-    assert meta.model == MODEL_HAIKU
-    # Haiku NEVER carries the compaction beta — assert at the live boundary
-    # too (we didn't request compaction; this still confirms no surprise).
-    assert COMPACTION_BETA not in meta.betas_sent
+    assert meta.model == MODEL_CHEAP
 
 
 @pytest.mark.skipif(
-    os.environ.get("RUN_LIVE_TESTS") != "1" or not os.environ.get("ANTHROPIC_API_KEY"),
-    reason="RUN_LIVE_TESTS=1 and ANTHROPIC_API_KEY must be set",
+    os.environ.get("RUN_LIVE_TESTS") != "1" or not os.environ.get("OPENAI_API_KEY"),
+    reason="RUN_LIVE_TESTS=1 and OPENAI_API_KEY must be set",
 )
-def test_live_sonnet_caching_two_calls() -> None:
-    """Make two identical Sonnet calls and assert the second shows cache_read > 0.
-
-    The stable prefix is the long agent_spec block — well above the 1024-token
-    Sonnet cache minimum.
-    """
-    long_spec = (
-        "You are the 4xPrima market_context_agent smoke tester. " * 200
-        + "\nWhen called, return title='cached' and score=0.42."
+def test_live_default_caching_two_calls() -> None:
+    """Two identical-prefix DEFAULT-tier calls; second should show
+    cached_tokens > 0. The stable prefix is built to cross the 1024-token
+    OpenAI threshold."""
+    long_stable = (
+        "You are the 4xPrima market_context_agent caching smoke tester. "
+        * 250
+        + "\nWhen called, emit a TinyReport with title='cached' and score=0.42."
     )
-    settings = AnthropicSettings()
-    client = LLMClient(settings)
-    request = AgentRequest(
+    settings = OpenAISettings()
+    provider = OpenAIProvider(settings)
+    _, first = provider.generate_structured(
         agent_name="cache_smoke",
-        run_id="cache-test",
-        tier=ModelTier.SONNET,
-        stable_system_blocks=(
-            StableBlock(kind="spec", name="long_spec", text=long_spec),
-        ),
-        messages=({"role": "user", "content": "First call."},),
+        run_id="cache-test-1",
+        tier=ModelTier.DEFAULT,
+        stable_system=long_stable,
+        volatile_user="First call.",
+        output_model=TinyReport,
         max_output_tokens=256,
     )
-    _, first = client.call_structured(request, output_model=TinyReport)
-    # Second call — identical prefix, different volatile user turn.
-    request2 = AgentRequest(
+    _, second = provider.generate_structured(
         agent_name="cache_smoke",
-        run_id="cache-test",
-        tier=ModelTier.SONNET,
-        stable_system_blocks=(
-            StableBlock(kind="spec", name="long_spec", text=long_spec),
-        ),
-        messages=({"role": "user", "content": "Second call."},),
+        run_id="cache-test-2",
+        tier=ModelTier.DEFAULT,
+        stable_system=long_stable,
+        volatile_user="Second call.",
+        output_model=TinyReport,
         max_output_tokens=256,
     )
-    _, second = client.call_structured(request2, output_model=TinyReport)
-    assert first.usage.cache_creation_input_tokens > 0
-    assert second.usage.cache_read_input_tokens > 0
+    # The cache is best-effort; we don't assert exact numbers, only that the
+    # second call shows SOMETHING cached when the prefix re-occurs identically.
+    assert first.usage.prompt_tokens > 0
+    assert second.usage.cached_tokens > 0, (
+        f"second call should hit cache; got {second.usage}"
+    )

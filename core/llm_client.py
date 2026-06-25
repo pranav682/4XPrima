@@ -1,22 +1,29 @@
-"""Shared LLM client for the slow loop.
+"""Provider-agnostic LLM client for the slow loop.
 
 **All runtime LLM calls in 4xPrima must go through this module.** Direct calls
-to :func:`anthropic.Anthropic().messages.create` from anywhere else are
-forbidden by project convention (``CLAUDE.md``) — they bypass cache layout,
-model routing, capability resolution, and usage accounting.
+to the OpenAI SDK from anywhere else are forbidden by project convention
+(``CLAUDE.md``) — they bypass the message-structure discipline, tier routing,
+and usage accounting this wrapper enforces.
 
-This module encodes the conventions in ``docs/llm-conventions.md`` and the
-hard guard the user flagged: server-side compaction (``compact_20260112``) is
-only valid on Opus 4.6+ and Sonnet 4.6+. Haiku 4.5 calls **must not** carry
-the ``compact-2026-01-12`` beta header. Capability resolution happens
-per-call against the chosen model, never against a global default.
+Two abstractions:
 
-Verified against ``platform.claude.com/docs`` (2026-06-24):
-- Compaction supported: Opus 4.6 / 4.7 / 4.8, Sonnet 4.6, Fable 5,
-  Mythos 5 / Mythos Preview.
-- Compaction NOT supported: Haiku 4.5 (and older Sonnets / Opuses).
-- ``clear_thinking_20251015`` and ``clear_tool_uses_20250919`` work on all
-  supported models with beta ``context-management-2025-06-27``.
+- :class:`LLMProvider` — the Protocol agents depend on. Its workhorse method is
+  :meth:`LLMProvider.generate_structured`, which takes a stable system prefix,
+  a volatile user payload, and a pydantic output model.
+- :class:`OpenAIProvider` — the runtime implementation against the OpenAI SDK.
+  Uses ``client.chat.completions.parse(response_format=PydanticModel)`` for
+  structured output (the SDK's pydantic-native Structured Outputs path).
+
+Conventions encoded here (see ``docs/llm-conventions.md`` for the rationale):
+
+- Caching is AUTOMATIC. We do not set ``cache_control``; we structure each call
+  as ``[system: STABLE PREFIX] + [user: VOLATILE PAYLOAD]`` and rely on
+  OpenAI to cache the system prefix when it crosses the ~1024 token threshold.
+- Tier routing pins to current GPT-5 family names (CHEAP / DEFAULT / HEAVY).
+- Token accounting records ``prompt_tokens``, ``cached_tokens`` (from
+  ``usage.prompt_tokens_details.cached_tokens``), and ``completion_tokens``.
+- All SDK errors are wrapped in :class:`LlmClientError`; the API key never
+  appears in the error message.
 """
 
 from __future__ import annotations
@@ -24,195 +31,78 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Final, Literal, Protocol, TypeVar
+from typing import Any, Final, Protocol, TypeVar
 
-import anthropic
+import openai
 import structlog
 from pydantic import BaseModel, ValidationError
 
-from core.config import AnthropicSettings
+from core.config import OpenAISettings
 
 # ---------------------------------------------------------------------------
-# Pinned model strings (single source of truth — see docs/llm-conventions.md §4).
-# Switching models invalidates the prompt cache, so pin and bump explicitly.
+# Pinned model strings — see docs/llm-conventions.md §3.
+# Bumping a model is a deliberate change reviewed against the docs.
 # ---------------------------------------------------------------------------
 
-MODEL_HAIKU: str = "claude-haiku-4-5-20251001"
-MODEL_SONNET: str = "claude-sonnet-4-6"
-MODEL_OPUS: str = "claude-opus-4-8"
-
-# Beta headers
-CONTEXT_MANAGEMENT_BETA: str = "context-management-2025-06-27"
-COMPACTION_BETA: str = "compact-2026-01-12"
-
-# Tool Search Tool identifiers
-TOOL_SEARCH_REGEX: str = "tool_search_tool_regex_20251119"
-TOOL_SEARCH_BM25: str = "tool_search_tool_bm25_20251119"
-
-# Context-management edit identifiers
-CONTEXT_EDIT_COMPACT: str = "compact_20260112"
-CONTEXT_EDIT_CLEAR_THINKING: str = "clear_thinking_20251015"
-CONTEXT_EDIT_CLEAR_TOOL_USES: str = "clear_tool_uses_20250919"
-
-# Memory tool identifier
-MEMORY_TOOL_TYPE: str = "memory_20250818"
-MEMORY_TOOL_NAME: str = "memory"
-
-# Name of the synthetic tool the wrapper adds for structured output.
-STRUCTURED_OUTPUT_TOOL_NAME: Final[str] = "submit_structured_output"
+MODEL_CHEAP: Final[str] = "gpt-5.4-nano"
+MODEL_DEFAULT: Final[str] = "gpt-5.4"
+MODEL_HEAVY: Final[str] = "gpt-5.5"
 
 
 class ModelTier(StrEnum):
     """Which model class to route to. Picked per agent in its spec."""
 
-    HAIKU = "haiku"
-    SONNET = "sonnet"
-    OPUS = "opus"
+    CHEAP = "cheap"
+    DEFAULT = "default"
+    HEAVY = "heavy"
 
 
 def model_for_tier(tier: ModelTier) -> str:
     return {
-        ModelTier.HAIKU: MODEL_HAIKU,
-        ModelTier.SONNET: MODEL_SONNET,
-        ModelTier.OPUS: MODEL_OPUS,
+        ModelTier.CHEAP: MODEL_CHEAP,
+        ModelTier.DEFAULT: MODEL_DEFAULT,
+        ModelTier.HEAVY: MODEL_HEAVY,
     }[tier]
 
 
-# Capability matrix — which beta features each tier supports. The user
-# flagged this as the guard for the project: compaction MUST NEVER ride a
-# Haiku call. Resolution happens at call time against the CHOSEN tier.
-_TIER_SUPPORTS_COMPACTION: Final[dict[ModelTier, bool]] = {
-    ModelTier.HAIKU: False,
-    ModelTier.SONNET: True,
-    ModelTier.OPUS: True,
-}
-
-
-def tier_supports_compaction(tier: ModelTier) -> bool:
-    """Public predicate: may a call on this tier carry compaction?
-
-    Documented separately so tests and callers can both read it.
-    """
-    return _TIER_SUPPORTS_COMPACTION[tier]
-
-
 # ---------------------------------------------------------------------------
-# Message-assembly types
+# Data types
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class StableBlock:
-    """A piece of the stable prefix (agent spec, a skill, taxonomy, etc.)."""
-
-    kind: Literal["spec", "skill", "taxonomy", "schema", "policy_stable"]
-    name: str
-    text: str
-
-
-@dataclass(frozen=True, slots=True)
-class VolatilePolicy:
-    """Per-call policy overrides that go AFTER the cache breakpoint inside
-    ``system``. Use sparingly; anything that changes per call belongs here."""
-
-    text: str
-
-
-@dataclass(frozen=True, slots=True)
-class ToolSpec:
-    """One tool definition. ``defer_loading=True`` keeps it out of the eager
-    prefix; the Tool Search Tool is added automatically when any tool is
-    deferred."""
-
-    name: str
-    description: str
-    input_schema: dict[str, Any]
-    defer_loading: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class ContextManagementConfig:
-    """Server-side context-management config for long-running agents.
-
-    Caller's *desired* configuration. The wrapper resolves what is actually
-    valid for the chosen tier (see :func:`resolve_context_management`). A
-    Haiku call with ``enable_compaction=True`` SILENTLY drops compaction and
-    its beta; the other edits still apply.
-    """
-
-    enable_compaction: bool = False
-    compact_trigger_input_tokens: int = 120_000
-    compact_pause_after: bool = False
-    compact_instructions: str | None = None
-
-    enable_clear_thinking: bool = True
-    clear_thinking_keep_turns: int = 2
-
-    enable_clear_tool_uses: bool = True
-    clear_tool_uses_trigger_input_tokens: int = 60_000
-    clear_tool_uses_keep: int = 5
-    clear_tool_uses_clear_at_least_input_tokens: int = 10_000
-    exclude_tools_from_clear: tuple[str, ...] = ("memory",)
-
-
-@dataclass(frozen=True, slots=True)
-class AgentRequest:
-    """Everything :meth:`LLMClient.call_structured` needs."""
-
-    agent_name: str
-    run_id: str
-    tier: ModelTier
-
-    tools: tuple[ToolSpec, ...] = ()
-    stable_system_blocks: tuple[StableBlock, ...] = ()
-    volatile_policy: VolatilePolicy | None = None
-    messages: tuple[dict[str, Any], ...] = ()
-
-    max_output_tokens: int = 2048
-    context_management: ContextManagementConfig | None = None
-    enable_memory_tool: bool = False
-    cache_ttl: Literal["5m", "1h"] = "5m"
-    tool_search_variant: Literal["bm25", "regex"] = "bm25"
-
-    extra_metadata: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class TokenUsage:
-    """Token accounting for a single call."""
+    """Token accounting for one call.
 
-    input_tokens: int
-    cache_read_input_tokens: int
-    cache_creation_input_tokens: int
-    output_tokens: int
+    ``cached_tokens`` is a SUBSET of ``prompt_tokens`` (OpenAI reports the
+    cached share within the prompt). Cache hit ratio is
+    ``cached_tokens / prompt_tokens``.
+    """
 
-    @property
-    def total_input_tokens(self) -> int:
-        return (
-            self.input_tokens
-            + self.cache_read_input_tokens
-            + self.cache_creation_input_tokens
-        )
+    prompt_tokens: int
+    cached_tokens: int
+    completion_tokens: int
 
     @property
     def cache_hit_ratio(self) -> float:
-        denom = self.total_input_tokens
-        return (self.cache_read_input_tokens / denom) if denom else 0.0
+        return (self.cached_tokens / self.prompt_tokens) if self.prompt_tokens else 0.0
 
 
 @dataclass(frozen=True, slots=True)
 class AgentResponse:
-    """Metadata about one LLM call. Decoupled from the parsed output so
-    structured-output callers can return ``(parsed_model, AgentResponse)``."""
+    """Metadata about one LLM call.
+
+    Decoupled from the parsed output so structured-output callers can return
+    ``(parsed_model, AgentResponse)``.
+    """
 
     agent_name: str
     run_id: str
-    model: str
     tier: ModelTier
-    stop_reason: str
+    model: str
+    finish_reason: str
     usage: TokenUsage
-    betas_sent: tuple[str, ...]
-    applied_context_edits: list[dict[str, Any]] = field(default_factory=list)
+    extra_metadata: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -223,171 +113,14 @@ class AgentResponse:
 class LlmClientError(Exception):
     """Unrecoverable LLM call failure.
 
-    Wraps anthropic SDK errors and schema-validation failures. Error messages
-    never include the API key (the SDK error already redacts it; we also do
-    not log SecretStr.get_secret_value()).
+    Wraps SDK errors and schema-validation failures. Error messages never
+    include the API key (the SDK's errors redact it; we also never
+    interpolate ``SecretStr.get_secret_value()`` into a message).
     """
 
 
 # ---------------------------------------------------------------------------
-# Wire-format assembly
-# ---------------------------------------------------------------------------
-
-
-def build_system_blocks(
-    stable_blocks: tuple[StableBlock, ...],
-    volatile_policy: VolatilePolicy | None,
-    cache_ttl: Literal["5m", "1h"],
-) -> list[dict[str, Any]]:
-    """Build the ``system`` array.
-
-    The single explicit ``cache_control`` marker is placed on the LAST stable
-    block. Volatile policy (if any) is appended after with no cache_control —
-    so it never enters the cache and never invalidates it.
-    """
-    if not stable_blocks:
-        raise ValueError("stable_blocks must not be empty — cache the agent spec")
-
-    system: list[dict[str, Any]] = []
-    last_index = len(stable_blocks) - 1
-    for i, block in enumerate(stable_blocks):
-        item: dict[str, Any] = {"type": "text", "text": block.text}
-        if i == last_index:
-            cache_control: dict[str, Any] = {"type": "ephemeral"}
-            if cache_ttl == "1h":
-                cache_control["ttl"] = "1h"
-            item["cache_control"] = cache_control
-        system.append(item)
-
-    if volatile_policy is not None:
-        system.append({"type": "text", "text": volatile_policy.text})
-
-    return system
-
-
-def build_tools(
-    tools: tuple[ToolSpec, ...],
-    tool_search_variant: Literal["bm25", "regex"],
-    enable_memory_tool: bool,
-    structured_output_tool: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """Assemble the ``tools`` array.
-
-    Adds a Tool Search Tool when any user tool is deferred; adds the memory
-    tool when ``enable_memory_tool=True``. The optional structured-output
-    tool is appended last (eager — never deferred), so callers forcing a
-    tool call (structured output) can find it.
-    """
-    out: list[dict[str, Any]] = []
-
-    has_any_deferred = any(t.defer_loading for t in tools)
-    if has_any_deferred:
-        ts_type = TOOL_SEARCH_BM25 if tool_search_variant == "bm25" else TOOL_SEARCH_REGEX
-        out.append({"type": ts_type, "name": ts_type})
-
-    if enable_memory_tool:
-        out.append({"type": MEMORY_TOOL_TYPE, "name": MEMORY_TOOL_NAME})
-
-    for t in tools:
-        out.append(
-            {
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.input_schema,
-                "defer_loading": t.defer_loading,
-            }
-        )
-
-    if structured_output_tool is not None:
-        out.append(structured_output_tool)
-
-    if out and all(item.get("defer_loading") for item in out):
-        raise ValueError(
-            "all tools deferred — keep the Tool Search Tool / structured-output "
-            "tool eager or mark one tool non-deferred"
-        )
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Tier-aware context-management resolution (THE compaction guard)
-# ---------------------------------------------------------------------------
-
-
-def resolve_context_management(
-    config: ContextManagementConfig | None,
-    tier: ModelTier,
-) -> tuple[dict[str, Any] | None, list[str]]:
-    """Resolve the ``context_management`` payload AND required beta headers
-    for the chosen tier.
-
-    The compaction guard lives here: if ``tier`` is Haiku and the caller
-    asked for compaction, compaction is silently dropped. The
-    ``compact-2026-01-12`` beta is also dropped. Clearing edits still apply.
-
-    Returns ``(context_management_body | None, list[str] of beta headers)``.
-    """
-    if config is None:
-        return None, []
-
-    edits: list[dict[str, Any]] = []
-    betas: list[str] = []
-
-    # 1. Compaction (capability-gated).
-    if config.enable_compaction:
-        if tier_supports_compaction(tier):
-            compact_edit: dict[str, Any] = {
-                "type": CONTEXT_EDIT_COMPACT,
-                "trigger": {
-                    "type": "input_tokens",
-                    "value": config.compact_trigger_input_tokens,
-                },
-                "pause_after_compaction": config.compact_pause_after,
-            }
-            if config.compact_instructions is not None:
-                compact_edit["instructions"] = config.compact_instructions
-            edits.append(compact_edit)
-            betas.append(COMPACTION_BETA)
-        # else: silently drop. The user's stated guard — Haiku must never
-        # carry the compaction beta — is enforced by NOT appending here.
-
-    # 2. Thinking clearing.
-    if config.enable_clear_thinking:
-        edits.append(
-            {
-                "type": CONTEXT_EDIT_CLEAR_THINKING,
-                "keep": {"type": "thinking_turns", "value": config.clear_thinking_keep_turns},
-            }
-        )
-
-    # 3. Tool-use clearing.
-    if config.enable_clear_tool_uses:
-        edits.append(
-            {
-                "type": CONTEXT_EDIT_CLEAR_TOOL_USES,
-                "trigger": {
-                    "type": "input_tokens",
-                    "value": config.clear_tool_uses_trigger_input_tokens,
-                },
-                "keep": {"type": "tool_uses", "value": config.clear_tool_uses_keep},
-                "clear_at_least": {
-                    "type": "input_tokens",
-                    "value": config.clear_tool_uses_clear_at_least_input_tokens,
-                },
-                "exclude_tools": list(config.exclude_tools_from_clear),
-            }
-        )
-
-    # 4. The clear_* edits ride the context-management beta.
-    if config.enable_clear_thinking or config.enable_clear_tool_uses:
-        betas.append(CONTEXT_MANAGEMENT_BETA)
-
-    return ({"edits": edits} if edits else None), betas
-
-
-# ---------------------------------------------------------------------------
-# Usage accounting interop
+# Accounting interop
 # ---------------------------------------------------------------------------
 
 
@@ -406,168 +139,165 @@ class UsageRecorder(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Client
+# Provider Protocol — agents depend on THIS, not on OpenAI
 # ---------------------------------------------------------------------------
 
 
 T = TypeVar("T", bound=BaseModel)
 
 
-class LLMClient:
-    """Thin Anthropic SDK wrapper enforcing the project's conventions.
+class LLMProvider(Protocol):
+    """The Protocol agents depend on.
 
-    Construction:
+    Switching providers later is a one-file change (a new implementation of
+    this Protocol), not a refactor of every agent.
+    """
 
-        >>> client = LLMClient(settings, usage_recorder=recorder)
+    def generate_structured(
+        self,
+        *,
+        agent_name: str,
+        run_id: str,
+        tier: ModelTier,
+        stable_system: str,
+        volatile_user: str,
+        output_model: type[T],
+        max_output_tokens: int = 2048,
+        extra_metadata: dict[str, str] | None = None,
+    ) -> tuple[T, AgentResponse]:
+        """Issue one structured call. Returns the parsed pydantic instance
+        and a typed response metadata object.
 
-    Calls:
+        Raises:
+            LlmClientError: on SDK failure, schema-validation failure, or
+                any other unrecoverable failure.
+        """
+        ...
 
-        >>> parsed, meta = client.call_structured(
-        ...     request=AgentRequest(...),
-        ...     output_model=MarketContextReport,
-        ... )
 
-    The wrapper:
+# ---------------------------------------------------------------------------
+# OpenAI implementation
+# ---------------------------------------------------------------------------
 
-      1. Resolves the tier to a pinned model string.
-      2. Builds the ``tools``, ``system``, and ``messages`` arrays per the
-         caching conventions (one ``cache_control`` on the last stable block).
-      3. Resolves ``context_management`` and required betas FOR THE CHOSEN
-         TIER (Haiku never carries the compaction beta).
-      4. Forces the model to call a structured-output tool whose schema is
-         derived from ``output_model``.
-      5. Parses the tool call into ``output_model``, raising
-         :class:`LlmClientError` on schema-validation failure.
-      6. Records token usage via :class:`UsageRecorder`.
+
+class OpenAIProvider:
+    """OpenAI-backed implementation of :class:`LLMProvider`.
+
+    Constructed with an :class:`OpenAISettings` (SecretStr-wrapped key);
+    the underlying ``openai.OpenAI`` client is injectable for tests so we
+    never need to monkey-patch the SDK module.
     """
 
     def __init__(
         self,
-        settings: AnthropicSettings,
+        settings: OpenAISettings,
         *,
+        openai_client: Any | None = None,
         usage_recorder: UsageRecorder | None = None,
-        anthropic_client: Any | None = None,
         logger: structlog.stdlib.BoundLogger | None = None,
     ) -> None:
         self._settings = settings
         self._usage_recorder = usage_recorder
-        # `anthropic_client` is injectable so tests don't have to monkeypatch
-        # the SDK module-level constructor.
-        if anthropic_client is None:
-            self._client = anthropic.Anthropic(api_key=settings.api_key.get_secret_value())
+        if openai_client is None:
+            kwargs: dict[str, Any] = {"api_key": settings.api_key.get_secret_value()}
+            if settings.project:
+                kwargs["project"] = settings.project
+            if settings.org:
+                kwargs["organization"] = settings.org
+            self._client = openai.OpenAI(**kwargs)
         else:
-            self._client = anthropic_client
+            self._client = openai_client
         self._logger = (
             logger if logger is not None else _default_logger()
-        ).bind(component="llm_client")
+        ).bind(component="openai_provider")
 
-    def call_structured(
+    # ---------------------------------------------------------- workhorse
+
+    def generate_structured(
         self,
-        request: AgentRequest,
         *,
+        agent_name: str,
+        run_id: str,
+        tier: ModelTier,
+        stable_system: str,
+        volatile_user: str,
         output_model: type[T],
+        max_output_tokens: int = 2048,
+        extra_metadata: dict[str, str] | None = None,
     ) -> tuple[T, AgentResponse]:
-        """Issue one agent call and return the parsed structured output.
+        if not stable_system:
+            raise ValueError("stable_system must not be empty — cache the agent spec")
+        if not volatile_user:
+            raise ValueError("volatile_user must not be empty")
 
-        The wrapper adds a forced tool call whose input_schema is
-        ``output_model.model_json_schema()``. The model's response must be
-        a single tool_use block invoking that tool; the input dict is
-        validated into ``output_model``.
-
-        Raises:
-            LlmClientError: on SDK failure, missing tool call, or
-                schema validation failure. Never includes the API key.
-        """
-        # 1. Resolve tier → model.
-        model = model_for_tier(request.tier)
-
-        # 2. Build system / tools / messages.
-        system = build_system_blocks(
-            request.stable_system_blocks,
-            request.volatile_policy,
-            request.cache_ttl,
-        )
-        structured_tool = _build_structured_output_tool(output_model)
-        tools = build_tools(
-            request.tools,
-            request.tool_search_variant,
-            request.enable_memory_tool,
-            structured_output_tool=structured_tool,
-        )
-
-        # 3. Resolve context_management + betas for THIS tier (the guard).
-        ctx_mgmt, betas = resolve_context_management(request.context_management, request.tier)
-
-        # 4. Compose call kwargs.
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "max_tokens": request.max_output_tokens,
-            "system": system,
-            "messages": list(request.messages),
-            "tools": tools,
-            "tool_choice": {"type": "tool", "name": STRUCTURED_OUTPUT_TOOL_NAME},
-        }
-        if ctx_mgmt is not None:
-            kwargs["context_management"] = ctx_mgmt
-        if betas:
-            kwargs["betas"] = betas
+        model = model_for_tier(tier)
+        messages = [
+            {"role": "system", "content": stable_system},
+            {"role": "user", "content": volatile_user},
+        ]
+        meta = dict(extra_metadata or {})
 
         self._logger.info(
             "llm_call_dispatch",
-            agent_name=request.agent_name,
-            run_id=request.run_id,
-            tier=request.tier.value,
+            agent_name=agent_name,
+            run_id=run_id,
+            tier=tier.value,
             model=model,
-            n_stable_blocks=len(request.stable_system_blocks),
-            n_messages=len(request.messages),
-            n_tools=len(tools),
-            betas=list(betas),
-            has_context_management=ctx_mgmt is not None,
+            stable_system_chars=len(stable_system),
+            volatile_user_chars=len(volatile_user),
+            max_output_tokens=max_output_tokens,
         )
 
-        # 5. Make the call. The `client.beta.messages.create` path accepts
-        #    both legacy and beta kwargs; calls with empty `betas` are
-        #    equivalent to a normal call.
         try:
-            response = self._client.beta.messages.create(**kwargs)
-        except anthropic.AnthropicError as e:
-            # The SDK's error repr does not include the API key, but defend
-            # against future changes by stringifying explicitly here.
-            raise LlmClientError(f"Anthropic API error: {type(e).__name__}: {e}") from e
+            completion = self._client.chat.completions.parse(
+                model=model,
+                messages=messages,
+                response_format=output_model,
+                max_completion_tokens=max_output_tokens,
+            )
+        except openai.OpenAIError as e:
+            # The SDK's error string already redacts the key; we also never
+            # interpolate the key here. Type name + message is enough for
+            # debugging without ever exposing a secret.
+            raise LlmClientError(f"OpenAI API error: {type(e).__name__}: {e}") from e
         except Exception as e:
-            raise LlmClientError(f"unexpected error from Anthropic SDK: {e!r}") from e
+            raise LlmClientError(f"unexpected error from OpenAI SDK: {e!r}") from e
 
-        # 6. Parse the response: locate the tool_use block, validate input.
-        tool_input = _extract_tool_input(response)
+        # Parse the response: the SDK gives us a pydantic instance directly.
+        parsed_raw = _extract_parsed(completion, output_model)
+
+        # Belt-and-braces re-validation at our boundary. ``parsed_raw`` is
+        # already a pydantic instance, but if the SDK ever changes how
+        # strict-mode is enforced we catch any drift here.
         try:
-            parsed = output_model(**tool_input)
+            parsed = output_model.model_validate(parsed_raw.model_dump())
         except ValidationError as e:
             raise LlmClientError(
                 f"model output failed schema validation for "
                 f"{output_model.__name__}: {e}"
             ) from e
 
-        # 7. Token accounting.
-        usage = _extract_usage(response)
-        meta = AgentResponse(
-            agent_name=request.agent_name,
-            run_id=request.run_id,
+        # Usage accounting.
+        usage = _extract_usage(completion)
+        finish_reason = _extract_finish_reason(completion)
+        response_meta = AgentResponse(
+            agent_name=agent_name,
+            run_id=run_id,
+            tier=tier,
             model=model,
-            tier=request.tier,
-            stop_reason=getattr(response, "stop_reason", "") or "",
+            finish_reason=finish_reason,
             usage=usage,
-            betas_sent=tuple(betas),
-            applied_context_edits=_extract_applied_edits(response),
+            extra_metadata=meta,
         )
         if self._usage_recorder is not None:
             self._usage_recorder.record(
-                agent_name=request.agent_name,
-                run_id=request.run_id,
+                agent_name=agent_name,
+                run_id=run_id,
                 model=model,
                 usage=usage,
-                extra={"tier": request.tier.value, **request.extra_metadata},
+                extra={"tier": tier.value, **meta},
             )
-        return parsed, meta
+        return parsed, response_meta
 
 
 # ---------------------------------------------------------------------------
@@ -575,86 +305,57 @@ class LLMClient:
 # ---------------------------------------------------------------------------
 
 
-def _build_structured_output_tool(output_model: type[BaseModel]) -> dict[str, Any]:
-    """Build the forced-tool definition for structured output."""
-    schema = output_model.model_json_schema()
-    return {
-        "name": STRUCTURED_OUTPUT_TOOL_NAME,
-        "description": (
-            f"Submit the structured response as a {output_model.__name__}. "
-            "Call this tool exactly once with all required fields filled."
-        ),
-        "input_schema": schema,
-    }
+def _extract_parsed(completion: Any, output_model: type[BaseModel]) -> BaseModel:
+    """Pull the parsed pydantic instance out of a chat-completions.parse() result.
 
-
-def _extract_tool_input(response: Any) -> dict[str, Any]:
-    """Find the structured-output tool's input in the response content.
-
-    The Anthropic SDK response.content is a list of blocks. We skip thinking
-    / text blocks and pick the tool_use one whose ``name`` matches our
-    synthetic tool. If we don't find one, the model didn't honour tool_choice
-    — that's an :class:`LlmClientError`, not a parse-as-best-effort case.
+    The SDK puts the parsed instance on ``choices[0].message.parsed``. If a
+    safety refusal happened, ``choices[0].message.refusal`` carries text.
     """
-    content = getattr(response, "content", None) or []
-    for block in content:
-        # Anthropic blocks are objects; tests may pass plain dicts.
-        block_type = getattr(block, "type", None) or (
-            block.get("type") if isinstance(block, dict) else None
+    choices = getattr(completion, "choices", None) or []
+    if not choices:
+        raise LlmClientError("OpenAI response had no choices")
+    msg = getattr(choices[0], "message", None)
+    if msg is None:
+        raise LlmClientError("OpenAI response choice had no message")
+    refusal = getattr(msg, "refusal", None)
+    if refusal:
+        raise LlmClientError(f"model refused the request: {refusal}")
+    parsed = getattr(msg, "parsed", None)
+    if parsed is None:
+        raise LlmClientError(
+            f"OpenAI response did not include a parsed {output_model.__name__}"
         )
-        if block_type != "tool_use":
-            continue
-        name = getattr(block, "name", None) or (
-            block.get("name") if isinstance(block, dict) else None
+    if not isinstance(parsed, BaseModel):
+        # The SDK should always return a pydantic instance when we passed a
+        # BaseModel class as response_format; this guards against shape drift.
+        raise LlmClientError(
+            f"parsed payload was not a pydantic model "
+            f"(got {type(parsed).__name__})"
         )
-        if name != STRUCTURED_OUTPUT_TOOL_NAME:
-            continue
-        input_obj = getattr(block, "input", None) or (
-            block.get("input") if isinstance(block, dict) else None
-        )
-        if not isinstance(input_obj, dict):
-            raise LlmClientError(
-                f"tool_use block for {STRUCTURED_OUTPUT_TOOL_NAME} had non-dict input"
-            )
-        return input_obj
-    raise LlmClientError(
-        f"response did not include a tool_use for {STRUCTURED_OUTPUT_TOOL_NAME}"
-    )
+    return parsed
 
 
-def _extract_usage(response: Any) -> TokenUsage:
-    """Read `response.usage.*`, defaulting missing fields to 0.
-
-    Compaction iterations (when enabled and triggered) are not aggregated
-    here yet — that's a future extension; this stage's only consumer
-    (market_context_agent) is a single-turn structured output.
-    """
-    usage_obj = getattr(response, "usage", None)
+def _extract_usage(completion: Any) -> TokenUsage:
+    """Read ``completion.usage.*``, defaulting missing fields to 0."""
+    usage_obj = getattr(completion, "usage", None)
     if usage_obj is None:
-        return TokenUsage(0, 0, 0, 0)
+        return TokenUsage(0, 0, 0)
+    prompt = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
+    completion_t = int(getattr(usage_obj, "completion_tokens", 0) or 0)
+    details = getattr(usage_obj, "prompt_tokens_details", None)
+    cached = 0
+    if details is not None:
+        cached = int(getattr(details, "cached_tokens", 0) or 0)
     return TokenUsage(
-        input_tokens=int(getattr(usage_obj, "input_tokens", 0) or 0),
-        cache_read_input_tokens=int(getattr(usage_obj, "cache_read_input_tokens", 0) or 0),
-        cache_creation_input_tokens=int(
-            getattr(usage_obj, "cache_creation_input_tokens", 0) or 0
-        ),
-        output_tokens=int(getattr(usage_obj, "output_tokens", 0) or 0),
+        prompt_tokens=prompt, cached_tokens=cached, completion_tokens=completion_t
     )
 
 
-def _extract_applied_edits(response: Any) -> list[dict[str, Any]]:
-    cm = getattr(response, "context_management", None)
-    if cm is None:
-        return []
-    applied = getattr(cm, "applied_edits", None) or []
-    out: list[dict[str, Any]] = []
-    for edit in applied:
-        if isinstance(edit, dict):
-            out.append(edit)
-        else:
-            # Best-effort: dump attributes that look like fields.
-            out.append({k: getattr(edit, k) for k in dir(edit) if not k.startswith("_")})
-    return out
+def _extract_finish_reason(completion: Any) -> str:
+    choices = getattr(completion, "choices", None) or []
+    if not choices:
+        return ""
+    return str(getattr(choices[0], "finish_reason", "") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -675,3 +376,18 @@ def _default_logger() -> structlog.stdlib.BoundLogger:
             cache_logger_on_first_use=True,
         )
     return structlog.get_logger("core.llm_client")
+
+
+__all__ = [
+    "MODEL_CHEAP",
+    "MODEL_DEFAULT",
+    "MODEL_HEAVY",
+    "AgentResponse",
+    "LLMProvider",
+    "LlmClientError",
+    "ModelTier",
+    "OpenAIProvider",
+    "TokenUsage",
+    "UsageRecorder",
+    "model_for_tier",
+]
