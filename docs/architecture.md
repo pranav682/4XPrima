@@ -62,7 +62,7 @@ Each agent has its own spec in `specs/agents/<name>.md`. Summary here only — g
 | --- | --- | --- | --- | --- |
 | **market_context_agent** | Read macro data, news, the economic calendar, sentiment. | Sonnet | raw feeds (via tools) | `MarketContextReport` (structured) |
 | **strategy_lab_agent** | Propose candidate strategy specs (entry/exit, indicators, timeframe). | Sonnet (Opus for novel design sessions) | `MarketContextReport`, champion stats | `StrategyCandidate` (structured) |
-| **backtest_agent** | Configure backtests; interpret results. Heavy compute is in deterministic `backtest/` code. | Sonnet | `StrategyCandidate`, backtest runner output | `BacktestInterpretation` (structured) |
+| **backtest_agent** | Configure backtests; interpret results. Heavy compute is in deterministic `core/backtest/` code. | Sonnet | `StrategyCandidate`, backtest runner output | `BacktestInterpretation` (structured) |
 | **optimization_agent** | Propose parameter changes **within bounded ranges only**. Every proposal is validation-gated. | Sonnet | `BacktestInterpretation`, parameter bounds | `ParameterProposal` (structured) |
 | **critic_agent** | Adversarial. Tries to kill each proposal via the overfitting checklist. | **Opus** | every proposal | `CriticVerdict` (`accept` / `reject` + reasons) |
 | **orchestrator_agent** | Schedule the slow loop; route work; hold run state; manage champion/challenger. | Sonnet (Haiku for routing-only ticks) | all agent outputs + run state | `SlowLoopRunState` + dispatch decisions |

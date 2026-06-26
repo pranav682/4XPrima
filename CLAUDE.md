@@ -61,14 +61,16 @@ A direct SDK call bypasses all of that and breaks the caching economics.
 
 ## Two-loop boundaries (where things live)
 
-| Concern | Lives in | Why |
-| --- | --- | --- |
-| Live price feed, broker adapter, order router | `execution/` (fast loop) | Must run without LLM. |
-| Strategy signal evaluation at runtime | `strategies/` (fast loop) | Deterministic, fast, testable. |
-| Risk manager + kill switch | `risk/` (fast loop) | Sacred — see invariant #2. |
-| Backtest engine | `backtest/` (deterministic) | Heavy compute; called BY the slow loop, not part of it. |
-| Agent prompts, agent orchestration, reports | `agents/` (slow loop) | LLM-driven, scheduled, proposes only. |
-| Shared LLM client, usage accounting | `core/` | Used only by the slow loop. |
+The codebase is a **single flat package under `core/`** — there are no top-level `execution/`, `strategies/`, `risk/`, `backtest/`, or `agents/` directories. The fast/slow split is a **code** boundary, not a directory one: the fast-loop modules are pure deterministic Python and **never import an LLM client**. That rule (invariant #1) is enforced by the code itself and its tests, not by where files sit. Keep new modules under `core/` and preserve the no-LLM-in-the-fast-path boundary regardless of layout.
+
+| Concern | Lives in | Loop / role | Why |
+| --- | --- | --- | --- |
+| Live price feed, broker adapter, order router | `core/market_data.py`, `core/broker.py`, `core/paper_broker.py`, `core/execution.py` | fast | Must run without LLM. |
+| Strategy signal evaluation at runtime | `core/strategy.py` | fast | Deterministic, fast, testable. |
+| Risk manager + kill switch | `core/risk_manager.py` | fast | Sacred — see invariant #2. |
+| Backtest engine | `core/backtest/` | deterministic | Heavy compute; called BY the slow loop, not part of it. |
+| Agent prompts, agent orchestration, reports | `core/agents/` | slow | LLM-driven, scheduled, proposes only. |
+| Shared LLM client, usage accounting | `core/llm_client.py`, `core/usage_accounting.py` | slow | Used only by the slow loop. |
 
 ## When in doubt
 
