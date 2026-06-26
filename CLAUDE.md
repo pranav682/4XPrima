@@ -16,8 +16,22 @@ The reporting agent + explicit approval gates are the bridge. Anything that chan
 1. **No LLM call is in the live trade-execution path.** Signals reach execution only through deterministic code.
 2. **Risk limits and the kill switch are sacred.** The optimization/improvement loop **cannot** override them — they are enforced by deterministic code that the slow loop does not configure.
 3. **Paper trading only** until a human explicitly approves live trading. Live credentials must be physically absent from the default environment.
-4. **Never commit secrets.** All API keys, broker creds, etc. live in `.env` (gitignored). Use `pydantic-settings` to load them.
+4. **Never commit secrets, and never echo or interpolate real secret values into commands, logs, or commit messages.** All API keys, broker creds, etc. live in `.env` (gitignored). Use `pydantic-settings` to load them (`SecretStr`). See "Security hygiene" below for the rule and the scan routine.
 5. **Every strategy/parameter change must pass walk-forward + out-of-sample validation AND the critic** before it can be proposed for deployment. No exceptions, no "small" tweaks.
+
+## Security hygiene
+
+> **The rule.** Never echo or interpolate a real secret value into a command, a log line, a commit message, a test fixture, a docstring, or any file or output. The bash history, your terminal scrollback, and any captured tool output count as outputs — once a secret lands there, it has leaked.
+
+What this means in practice:
+
+- **Safety scans are PATTERN-based, never literal-value-based.** A grep like `grep -E 'sk-svcacct-G-clgxF6...' tracked_files/` writes the real key into shell history and into any output that captures the command. The correct check uses a regex pattern that matches the *shape* of the token, not the value: `grep -E 'sk-(ant-|svcacct-|proj-)?[A-Za-z0-9_-]{20,}'`. Run `scripts/safety_scan.sh` — it does this for OpenAI, Anthropic, GitHub, AWS, Slack, GCP key, and JWT formats, plus asserts `.env` is gitignored and untracked.
+- **Reports never include matched text.** When the scan finds a token-shaped string, it prints `file:line` only — never the line itself — so even the *failure* output is safe.
+- **`SecretStr` everywhere at the boundary.** Pydantic-settings models wrap every key in `SecretStr` so accidental `repr()` / `str()` / structlog dumps print `**********`, not the value. Call `.get_secret_value()` only at the single point of HTTP construction and never store the result.
+- **Errors never re-include URLs or headers.** Provider wrappers (OANDA, FRED, OpenAI, etc.) catch SDK errors and re-raise with the error TYPE + safe message, never the request URL (which can carry the key in a query string) or the request headers.
+- **Prefer a real scanner as a pre-commit hook.** `gitleaks` or `trufflehog` catch entropy-based secrets that pattern matching misses. `scripts/safety_scan.sh` calls `gitleaks detect --no-banner --redact` automatically when it's installed. Install: `brew install gitleaks`.
+
+If you find yourself about to type a literal token into a command line, STOP. Load it from `.env` (`set -a; . ./.env; set +a`) and reference the variable name only.
 
 ## Coding conventions
 
