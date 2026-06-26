@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 from core.backtest import BacktestEngine, CostModel
 from core.models import (
@@ -55,6 +56,16 @@ class OneShotStrategy:
         self._trigger_len = trigger_len
         self._fired = False
 
+    def params(self) -> dict[str, Any]:
+        # Excludes the mutable `_fired` flag — runtime state, not identity.
+        return {
+            "pair": self._pair,
+            "direction": self._direction.value,
+            "size": str(self._size),
+            "stop_distance": str(self._stop_distance),
+            "trigger_len": self._trigger_len,
+        }
+
     def decide(
         self,
         bars: PointInTimeView,
@@ -90,6 +101,9 @@ class PeekingStrategy:
     """
 
     name = "peeking"
+
+    def params(self) -> dict[str, Any]:
+        return {}
 
     def decide(
         self,
@@ -343,6 +357,43 @@ def test_identical_inputs_give_identical_config_hash_and_result(
     assert [t.trade_id for t in r1.trade_log] == [t.trade_id for t in r2.trade_log]
     if r1.trade_log:
         assert r1.trade_log[0].trade_id == "t000000"
+
+
+def test_different_strategy_params_give_different_config_hash(
+    make_bars: Callable[..., list[Candle]],
+    roomy_risk_config: RiskConfig,
+    costed_model: CostModel,
+) -> None:
+    # Same bars / risk / cost / balance — ONLY the strategy parameters differ.
+    # These must NOT collide on config_hash: the optimization agent and the
+    # champion/challenger registry use config_hash as a strategy's identity.
+    bars = make_bars(_oscillating_closes())
+
+    def hash_for(fast: int, slow: int) -> str:
+        strat = MovingAverageCrossover(
+            pair="EURUSD",
+            fast_period=fast,
+            slow_period=slow,
+            size=Decimal("1000"),
+            stop_distance=Decimal("0.005"),
+        )
+        return (
+            BacktestEngine(
+                bars=bars,
+                strategy=strat,
+                risk_config=roomy_risk_config,
+                cost_model=costed_model,
+                starting_balance=Decimal("10000"),
+            )
+            .run()
+            .config_hash
+        )
+
+    h_10_20 = hash_for(10, 20)
+    h_50_200 = hash_for(50, 200)
+    assert h_10_20 != h_50_200
+    # And the same parameterization is stable across rebuilds.
+    assert h_10_20 == hash_for(10, 20)
 
 
 def test_reference_strategy_runs_end_to_end_on_a_fixture(

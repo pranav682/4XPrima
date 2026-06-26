@@ -195,3 +195,78 @@ def test_ma_crossover_emits_long_then_short_on_crosses(
     assert Direction.SHORT in directions
     # First signal is the up-cross (LONG), and a SHORT comes after it.
     assert directions.index(Direction.LONG) < directions.index(Direction.SHORT)
+
+
+# ---------------------------------------------------------------------------
+# params() — strategy identity (the config_hash input)
+# ---------------------------------------------------------------------------
+
+
+def test_ma_crossover_params_are_the_constructor_parameters() -> None:
+    import json
+
+    strat = MovingAverageCrossover(
+        pair="eurusd",  # normalised to upper-case
+        fast_period=10,
+        slow_period=20,
+        size=Decimal("1000"),
+        stop_distance=Decimal("0.005"),
+    )
+    assert strat.params() == {
+        "pair": "EURUSD",
+        "fast_period": 10,
+        "slow_period": 20,
+        "size": "1000",
+        "stop_distance": "0.005",
+    }
+    # Must be JSON-serialisable (the engine hashes it through json.dumps).
+    json.dumps(strat.params())
+
+
+def test_ma_crossover_params_exclude_mutable_runtime_state(
+    make_bars: Callable[..., list[Candle]],
+) -> None:
+    strat = MovingAverageCrossover(
+        pair="EURUSD",
+        fast_period=2,
+        slow_period=4,
+        size=Decimal("1000"),
+        stop_distance=Decimal("0.005"),
+    )
+    before = dict(strat.params())
+
+    # The cross-detection accumulator is runtime state, never identity.
+    assert "_prev_diff" not in strat.params()
+    assert "prev_diff" not in strat.params()
+
+    # Drive enough bars to mutate `_prev_diff` away from its initial None…
+    account = AccountState(
+        balance=Decimal("10000"),
+        equity=Decimal("10000"),
+        peak_equity=Decimal("10000"),
+        day_start_equity=Decimal("10000"),
+        as_of=datetime(2025, 1, 6, tzinfo=UTC),
+    )
+    bars = make_bars(["1.10", "1.11", "1.12", "1.13", "1.14", "1.15"])
+    for t in range(len(bars)):
+        strat.decide(PointInTimeView(bars, end_index=t), account, as_of=bars[t].time)
+    assert strat._prev_diff is not None  # runtime state really did change
+
+    # …yet identity is unchanged.
+    assert strat.params() == before
+
+
+def test_ma_crossover_params_distinguish_different_parameterizations() -> None:
+    def make(fast: int, slow: int, pair: str = "EURUSD") -> dict[str, object]:
+        return MovingAverageCrossover(
+            pair=pair,
+            fast_period=fast,
+            slow_period=slow,
+            size=Decimal("1000"),
+            stop_distance=Decimal("0.005"),
+        ).params()
+
+    assert make(10, 20) != make(50, 200)
+    assert make(10, 20) != make(11, 20)
+    assert make(10, 20, "EURUSD") != make(10, 20, "GBPUSD")
+    assert make(10, 20) == make(10, 20)

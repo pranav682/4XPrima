@@ -739,9 +739,11 @@ class BacktestEngine:
     def _config_hash(self) -> str:
         payload: dict[str, Any] = {
             "strategy_name": self._strategy.name,
-            "strategy_state_keys": sorted(
-                k for k in vars(self._strategy).keys() if not k.startswith("_")
-            ),
+            # Identity is the strategy's behaviour-defining parameters, NOT a
+            # filtered view of its __dict__ (which both misses underscored
+            # params and would sweep in mutable runtime state). See
+            # Strategy.params().
+            "strategy_params": self._strategy.params(),
             "risk_config": self._risk_config.model_dump(mode="json"),
             "cost_model": {
                 "half_spread": str(self._cost_model.half_spread),

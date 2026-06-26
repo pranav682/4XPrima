@@ -31,7 +31,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 
 from core.models import (
     AccountState,
@@ -165,6 +165,23 @@ class Strategy(Protocol):
         """
         ...
 
+    def params(self) -> dict[str, Any]:
+        """The behaviour-defining parameters that constitute this strategy's
+        identity — JSON-serialisable, ordered, and **deterministic**.
+
+        This is what the backtester hashes into ``config_hash`` and what the
+        optimization agent / champion-challenger registry treat as a
+        strategy's identity. Two instances with the same ``params()`` are the
+        same strategy; two with different ``params()`` are not.
+
+        It MUST contain only the parameters that change behaviour (periods,
+        sizing, pair, …) and MUST EXCLUDE mutable runtime state (indicator
+        accumulators, the previous-cross marker, etc.) — otherwise identity
+        would drift mid-run and two equivalent strategies would hash apart.
+        Decimal values are emitted as strings so the dict is JSON-safe.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # REFERENCE strategy — exercises the engine, NOT a researched edge
@@ -211,6 +228,21 @@ class MovingAverageCrossover:
     @property
     def pair(self) -> str:
         return self._pair
+
+    def params(self) -> dict[str, Any]:
+        """Identity = the constructor parameters only.
+
+        Deliberately excludes ``_prev_diff`` (the cross-detection accumulator),
+        which is transient runtime state, not part of what the strategy *is*.
+        Decimals are stringified so the dict is JSON-serialisable.
+        """
+        return {
+            "pair": self._pair,
+            "fast_period": self._fast,
+            "slow_period": self._slow,
+            "size": str(self._size),
+            "stop_distance": str(self._stop_distance),
+        }
 
     def decide(
         self,
