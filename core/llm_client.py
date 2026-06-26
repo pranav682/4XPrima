@@ -119,6 +119,21 @@ class LlmClientError(Exception):
     """
 
 
+class LlmTransientError(LlmClientError):
+    """Retryable failure: timeout, network blip, 5xx, throttling.
+
+    The :mod:`core.agents.runner` catches this, applies exponential
+    backoff with jitter, and retries up to a configured ceiling.
+    """
+
+
+class LlmFatalError(LlmClientError):
+    """Non-retryable failure: auth, bad request, quota exhausted, schema
+    validation. The runner surfaces this as a typed run failure (it does
+    not retry).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Accounting interop
 # ---------------------------------------------------------------------------
@@ -163,14 +178,16 @@ class LLMProvider(Protocol):
         volatile_user: str,
         output_model: type[T],
         max_output_tokens: int = 2048,
+        timeout_seconds: float | None = None,
         extra_metadata: dict[str, str] | None = None,
     ) -> tuple[T, AgentResponse]:
         """Issue one structured call. Returns the parsed pydantic instance
         and a typed response metadata object.
 
         Raises:
-            LlmClientError: on SDK failure, schema-validation failure, or
-                any other unrecoverable failure.
+            LlmTransientError: on retryable failure (timeout, 5xx, network).
+            LlmFatalError: on non-retryable failure (auth, bad request,
+                schema validation, quota exhausted).
         """
         ...
 
@@ -223,6 +240,7 @@ class OpenAIProvider:
         volatile_user: str,
         output_model: type[T],
         max_output_tokens: int = 2048,
+        timeout_seconds: float | None = None,
         extra_metadata: dict[str, str] | None = None,
     ) -> tuple[T, AgentResponse]:
         if not stable_system:
@@ -246,33 +264,58 @@ class OpenAIProvider:
             stable_system_chars=len(stable_system),
             volatile_user_chars=len(volatile_user),
             max_output_tokens=max_output_tokens,
+            timeout_seconds=timeout_seconds,
         )
 
+        # Per-call timeout overrides the client default when provided. The
+        # SDK's with_options(timeout=...) returns a scoped client.
+        client = self._client
+        if timeout_seconds is not None:
+            client = client.with_options(timeout=timeout_seconds)
+
         try:
-            completion = self._client.chat.completions.parse(
+            completion = client.chat.completions.parse(
                 model=model,
                 messages=messages,
                 response_format=output_model,
                 max_completion_tokens=max_output_tokens,
             )
+        except (openai.APIConnectionError, openai.APITimeoutError) as e:
+            raise LlmTransientError(
+                f"OpenAI transport: {type(e).__name__}: {e}"
+            ) from e
+        except openai.InternalServerError as e:
+            raise LlmTransientError(
+                f"OpenAI 5xx: {type(e).__name__}: {e}"
+            ) from e
+        except openai.RateLimitError as e:
+            # Quota exhausted is NOT transient; transient throttling IS.
+            if _is_insufficient_quota(e):
+                raise LlmFatalError(
+                    f"OpenAI quota exhausted: {type(e).__name__}: {e}"
+                ) from e
+            raise LlmTransientError(
+                f"OpenAI throttle: {type(e).__name__}: {e}"
+            ) from e
         except openai.OpenAIError as e:
-            # The SDK's error string already redacts the key; we also never
-            # interpolate the key here. Type name + message is enough for
-            # debugging without ever exposing a secret.
-            raise LlmClientError(f"OpenAI API error: {type(e).__name__}: {e}") from e
+            # Already redacts the key in its repr; we also never interpolate
+            # the key. Type name + message is enough for debugging without
+            # ever exposing a secret.
+            raise LlmFatalError(f"OpenAI API error: {type(e).__name__}: {e}") from e
         except Exception as e:
-            raise LlmClientError(f"unexpected error from OpenAI SDK: {e!r}") from e
+            raise LlmFatalError(f"unexpected error from OpenAI SDK: {e!r}") from e
 
         # Parse the response: the SDK gives us a pydantic instance directly.
         parsed_raw = _extract_parsed(completion, output_model)
 
         # Belt-and-braces re-validation at our boundary. ``parsed_raw`` is
         # already a pydantic instance, but if the SDK ever changes how
-        # strict-mode is enforced we catch any drift here.
+        # strict-mode is enforced we catch any drift here. Schema failure is
+        # FATAL: re-asking the same question would produce the same answer.
         try:
             parsed = output_model.model_validate(parsed_raw.model_dump())
         except ValidationError as e:
-            raise LlmClientError(
+            raise LlmFatalError(
                 f"model output failed schema validation for "
                 f"{output_model.__name__}: {e}"
             ) from e
@@ -310,29 +353,41 @@ def _extract_parsed(completion: Any, output_model: type[BaseModel]) -> BaseModel
 
     The SDK puts the parsed instance on ``choices[0].message.parsed``. If a
     safety refusal happened, ``choices[0].message.refusal`` carries text.
+    All failure modes here are FATAL: the model's content doesn't change on
+    re-ask without different inputs.
     """
     choices = getattr(completion, "choices", None) or []
     if not choices:
-        raise LlmClientError("OpenAI response had no choices")
+        raise LlmFatalError("OpenAI response had no choices")
     msg = getattr(choices[0], "message", None)
     if msg is None:
-        raise LlmClientError("OpenAI response choice had no message")
+        raise LlmFatalError("OpenAI response choice had no message")
     refusal = getattr(msg, "refusal", None)
     if refusal:
-        raise LlmClientError(f"model refused the request: {refusal}")
+        raise LlmFatalError(f"model refused the request: {refusal}")
     parsed = getattr(msg, "parsed", None)
     if parsed is None:
-        raise LlmClientError(
+        raise LlmFatalError(
             f"OpenAI response did not include a parsed {output_model.__name__}"
         )
     if not isinstance(parsed, BaseModel):
-        # The SDK should always return a pydantic instance when we passed a
-        # BaseModel class as response_format; this guards against shape drift.
-        raise LlmClientError(
+        raise LlmFatalError(
             f"parsed payload was not a pydantic model "
             f"(got {type(parsed).__name__})"
         )
     return parsed
+
+
+def _is_insufficient_quota(e: openai.RateLimitError) -> bool:
+    """Inspect a RateLimitError to decide retryable vs fatal."""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") or {}
+        if isinstance(err, dict) and err.get("code") == "insufficient_quota":
+            return True
+    # The SDK also stringifies the body into the message — fall back on that.
+    msg = str(e)
+    return "insufficient_quota" in msg
 
 
 def _extract_usage(completion: Any) -> TokenUsage:

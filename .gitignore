@@ -52,6 +52,9 @@ backtests/runs/
 *.parquet
 *.feather
 
+# Sample reports from dev CLIs — gitignored; one hand-trimmed copy lives in tests/fixtures/
+samples/
+
 # Notebooks (committable only with cleared outputs)
 .ipynb_checkpoints/
 

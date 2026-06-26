@@ -1,0 +1,65 @@
+{
+  "run_id": "ctx-fixture-001",
+  "as_of": "2026-06-24T12:00:00+00:00",
+  "schema_version": "1.0",
+  "regimes": [
+    {
+      "pair": "EURUSD",
+      "risk_state": "risk_off",
+      "trend_state": "trending_down",
+      "vol_state": "elevated",
+      "confidence": "0.62",
+      "rationale": "Soft EZ flash PMIs and firmer US 2Y yields in the brief."
+    },
+    {
+      "pair": "USDJPY",
+      "risk_state": "risk_off",
+      "trend_state": "range_wide",
+      "vol_state": "elevated",
+      "confidence": "0.55",
+      "rationale": "BoJ policy on hold; US yields support the floor."
+    }
+  ],
+  "key_scheduled_events": [
+    {
+      "when": "2026-06-25T12:30:00+00:00",
+      "currency": "USD",
+      "name": "Non-Farm Employment Change",
+      "impact": "high"
+    }
+  ],
+  "notable_surprises": [
+    {
+      "when": "2026-06-23T13:45:00+00:00",
+      "currency": "USD",
+      "name": "Flash Manufacturing PMI",
+      "actual": "55.0",
+      "forecast": "54.0",
+      "surprise": "1.0",
+      "significance": "Mildly positive print; coverage notes broad services strength."
+    }
+  ],
+  "sentiment": [
+    {
+      "currency": "USD",
+      "label": "positive",
+      "score": "0.30",
+      "rationale": "Hawkish Fed coverage dominates this morning's headlines."
+    },
+    {
+      "currency": "EUR",
+      "label": "negative",
+      "score": "-0.20",
+      "rationale": "Growth-soft narrative continues across EZ wires."
+    }
+  ],
+  "risk_flags": [
+    {
+      "code": "NFP_T+24h",
+      "severity": "warn",
+      "description": "NFP release tomorrow; expect wider spreads in the news window."
+    }
+  ],
+  "notes": "USD outperforming across G10 on yield differentials; EUR softer on growth read. EM mixed.",
+  "confidence": "0.55"
+}

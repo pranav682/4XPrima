@@ -83,7 +83,28 @@ Verified: 2026-06-25.
 
 ---
 
-## 6. Mandatory checklist for every new agent
+## 6. Evaluation gate (Tier-1 + Tier-2)
+
+Every agent runs through :class:`core.agents.runner.AgentRunner`, which wraps the LLM call with timeout, retry, budget enforcement, and an :class:`EvaluationGate`. The gate has two tiers:
+
+| Tier | What it is | Cost | Default | Effect of failure |
+| --- | --- | --- | --- | --- |
+| **Tier 1** | Per-agent deterministic structural + policy checks defined by `Agent.evaluations()`. No I/O. | Free | Always on | Hard reject — runner returns `AgentRunFailure(code="eval_rejected")`. |
+| **Tier 2** | LLM-as-judge on the CHEAP tier. Reads `(input_snapshot, output)` and scores coherence + spec conformance, returns `pass / flag / fail`. | One CHEAP-tier call | **Off** | Soft — `flag` / `fail` is logged and surfaced, NOT auto-rejected. |
+
+**Critical framing — read before you reach for Tier-2.** The judge is *quality control*, not a *predictive check*. It verifies internal consistency and spec conformance only: does the output cite numbers from the snapshot, is the language neutral, do regime + sentiment + surprise reads not contradict each other? It does NOT verify the agent is right about the market. **Predictive correctness is the backtester's job — never another model's opinion.** If we ever start auto-rejecting agent output because a judge LLM disagreed about *direction*, we've quietly built a system where one model's bias decides what the other models can say. That's a known failure mode of LLM-as-judge architectures and we explicitly avoid it.
+
+Tier-2 modes (configurable per gate instance):
+
+- `"off"` (default): no judge call ever happens. Verified by a test that asserts the provider mock is never called.
+- `"sampled"`: judge runs with probability `tier2_sample_rate` per call.
+- `"on"`: judge runs every Tier-1 pass.
+
+Constructor raises if `tier2_mode != "off"` without a provider — misconfiguration is caught at startup, not on the first call.
+
+Verified: 2026-06-26.
+
+## 7. Mandatory checklist for every new agent
 
 - [ ] Spec exists in `specs/agents/<name>.md` and lists inputs, tool deps, model tier, and the structured-output model.
 - [ ] All LLM calls go through `core/llm_client.py` — no direct `import openai` anywhere else.
@@ -99,6 +120,7 @@ Verified: 2026-06-25.
 
 ## Changelog
 
+- **2026-06-26** — Added §6: the two-tier evaluation gate (`AgentRunner` + `EvaluationGate`). Tier-1 deterministic + always on + hard reject; Tier-2 LLM-as-judge on the CHEAP tier, off by default, *soft* signals only. Documented the hard line: Tier-2 is internal-consistency / spec-conformance, NOT predictive correctness — the backtester is the only thing that judges directional accuracy.
 - **2026-06-25** — Switched the LLM layer to OpenAI. Retired the Anthropic-specific scaffolding (manual `cache_control`, compaction edits, context-management beta, tier-aware compaction guard) — none apply to OpenAI. New tier mapping: `CHEAP=gpt-5.4-nano`, `DEFAULT=gpt-5.4`, `HEAVY=gpt-5.5`. Caching is automatic at ≥1024 tokens with `usage.prompt_tokens_details.cached_tokens` reporting hits. Structured output via `client.chat.completions.parse(response_format=PydanticModel)`. Agents now depend on the provider-agnostic `LLMProvider` Protocol.
 - **2026-06-24** — *(superseded)* Corrections to the Anthropic conventions: bumped Opus tier to `claude-opus-4-8`; restored `compact_20260112` as a real edit type with the `compact-2026-01-12` beta. Retired by the 2026-06-25 OpenAI switch.
 - **2026-06-23** — *(superseded)* Initial Anthropic version. Retired by the 2026-06-25 OpenAI switch.

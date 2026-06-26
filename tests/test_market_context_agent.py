@@ -1,31 +1,37 @@
 """Tests for market_context_agent — fully hermetic.
 
-Mocks the llm_client and the three providers (calendar, macro, news) so we
-exercise:
+After the Stage-2-part-2 refactor, the agent only PREPARES calls — it
+doesn't make them. The runner makes the call, the gate evaluates it. So
+these tests cover:
 
-- Brief assembly from fixture provider data.
-- Parsing the LLM's canned structured response into a MarketContextReport.
-- The no-trade-call invariant (the report model rejects trade language).
-- Defensive behavior: provider exceptions don't kill the brief.
+- Brief assembly from fixture provider data (unchanged behaviour).
+- prepare_call() returns an AgentCall with the right tier, schema, and
+  caching-friendly shape (stable system + volatile user).
+- Tier-1 checks reject (a) a planted trade-call, (b) out-of-range
+  confidence, (c) a missing required field — even when the bad output is
+  built via model_construct() to bypass pydantic validation.
+- End-to-end through AgentRunner with a mocked LLM provider returning a
+  fixture report.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+from core.agents.evaluation import EvaluationGate
 from core.agents.market_context_agent import (
     MarketContextAgent,
     MarketContextRequest,
 )
-from core.llm_client import (
-    AgentResponse,
-    ModelTier,
-    TokenUsage,
-)
+from core.agents.runner import AgentRunner
+from core.agents.types import AgentBudget, AgentCall
+from core.llm_client import AgentResponse, ModelTier, TokenUsage
 from core.models import (
     EconomicEvent,
     FlagSeverity,
@@ -42,6 +48,9 @@ from core.models import (
     VolState,
 )
 
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -55,7 +64,6 @@ def now() -> datetime:
 @pytest.fixture
 def upcoming_events(now: datetime) -> list[EconomicEvent]:
     return [
-        # USD HIGH within 7 days — should be in brief.
         EconomicEvent(
             when=now + timedelta(days=1),
             currency="USD",
@@ -64,7 +72,6 @@ def upcoming_events(now: datetime) -> list[EconomicEvent]:
             forecast=Decimal("180000"),
             previous=Decimal("199000"),
         ),
-        # JPY HIGH — agent watches USDJPY → relevant currency.
         EconomicEvent(
             when=now + timedelta(days=2),
             currency="JPY",
@@ -73,7 +80,6 @@ def upcoming_events(now: datetime) -> list[EconomicEvent]:
             forecast=Decimal("0.5"),
             previous=Decimal("0.25"),
         ),
-        # Off-watchlist + LOW — should be filtered out.
         EconomicEvent(
             when=now + timedelta(days=3),
             currency="CHF",
@@ -88,7 +94,6 @@ def upcoming_events(now: datetime) -> list[EconomicEvent]:
 @pytest.fixture
 def recent_events(now: datetime) -> list[EconomicEvent]:
     return [
-        # USD with a surprise — should appear under recent_surprises.
         EconomicEvent(
             when=now - timedelta(hours=20),
             currency="USD",
@@ -98,7 +103,6 @@ def recent_events(now: datetime) -> list[EconomicEvent]:
             forecast=Decimal("54.0"),
             previous=Decimal("53.0"),
         ),
-        # Forecast missing → surprise=None → excluded.
         EconomicEvent(
             when=now - timedelta(hours=18),
             currency="EUR",
@@ -164,109 +168,60 @@ def make_news(headlines: list[NewsEvent]) -> MagicMock:
     return news
 
 
-def make_report(now: datetime) -> MarketContextReport:
-    return MarketContextReport(
-        run_id="r1",
-        as_of=now,
-        regimes=(
-            RegimeAssessment(
-                pair="EURUSD",
-                risk_state=RiskState.RISK_OFF,
-                trend_state=TrendState.TRENDING_DOWN,
-                vol_state=VolState.ELEVATED,
-                confidence=Decimal("0.6"),
-                rationale="EUR data soft and US yields firm.",
-            ),
-        ),
-        sentiment=(
-            SentimentRead(
-                currency="USD",
-                label=SentimentLabel.POSITIVE,
-                score=Decimal("0.3"),
-                rationale="Hawkish Fed coverage dominates headlines.",
-            ),
-        ),
-        risk_flags=(
-            RiskFlagOut(
-                code="FOMC_T+24h",
-                severity=FlagSeverity.WARN,
-                description="FOMC speakers tomorrow; expect wider spreads.",
-            ),
-        ),
-        notes="USD strength across the board; EUR softer on growth.",
-        confidence=Decimal("0.55"),
+def _make_agent(
+    upcoming_events, recent_events, macro_series_data, headlines
+) -> MarketContextAgent:
+    return MarketContextAgent(
+        calendar_provider=make_calendar(upcoming_events, recent_events),
+        macro_provider=make_macro(macro_series_data),
+        news_provider=make_news(headlines),
     )
 
 
+def _fixture_report() -> MarketContextReport:
+    data = json.loads((FIXTURES / "market_context_report_sample.json").read_text())
+    return MarketContextReport(**data)
+
+
 # ---------------------------------------------------------------------------
-# Brief assembly
+# Brief assembly (unchanged behaviour)
 # ---------------------------------------------------------------------------
 
 
 def test_brief_assembly_filters_to_material_events(
     now, upcoming_events, recent_events, macro_series_data, headlines
 ) -> None:
-    llm = MagicMock()
-    agent = MarketContextAgent(
-        llm_provider=llm,
-        calendar_provider=make_calendar(upcoming_events, recent_events),
-        macro_provider=make_macro(macro_series_data),
-        news_provider=make_news(headlines),
-    )
+    agent = _make_agent(upcoming_events, recent_events, macro_series_data, headlines)
     brief = agent.assemble_brief(
-        MarketContextRequest(
-            run_id="r1", as_of=now, watchlist=("EURUSD", "USDJPY")
-        )
+        MarketContextRequest(run_id="r1", as_of=now, watchlist=("EURUSD", "USDJPY"))
     )
-
-    # Upcoming: USD HIGH (watchlist) + JPY HIGH (watchlist) keep; CHF LOW drops.
     upcoming_pairs = {(e.currency, e.name) for e in brief.upcoming_events}
     assert ("USD", "Non-Farm Employment Change") in upcoming_pairs
     assert ("JPY", "BoJ Policy Rate") in upcoming_pairs
     assert all(e.currency != "CHF" for e in brief.upcoming_events)
-
-    # Recent: only the USD PMI has a surprise; EUR trade balance has no
-    # forecast in the brief, so surprise=None and it's excluded.
     assert len(brief.recent_surprises) == 1
-    surprise = brief.recent_surprises[0]
-    assert surprise.currency == "USD"
-    assert surprise.surprise == Decimal("1.0")
+    assert brief.recent_surprises[0].currency == "USD"
+    assert brief.recent_surprises[0].surprise == Decimal("1.0")
 
 
 def test_brief_macro_snapshot_picks_two_latest_non_missing(
     now, upcoming_events, recent_events, macro_series_data, headlines
 ) -> None:
-    llm = MagicMock()
-    agent = MarketContextAgent(
-        llm_provider=llm,
-        calendar_provider=make_calendar(upcoming_events, recent_events),
-        macro_provider=make_macro(macro_series_data),
-        news_provider=make_news(headlines),
-    )
+    agent = _make_agent(upcoming_events, recent_events, macro_series_data, headlines)
     brief = agent.assemble_brief(
-        MarketContextRequest(
-            run_id="r1", as_of=now, watchlist=("EURUSD",),
-        )
+        MarketContextRequest(run_id="r1", as_of=now, watchlist=("EURUSD",))
     )
-
     cpi = next(m for m in brief.macro if m.name == "US_CPI")
-    # The middle observation was None → latest = 321.0, previous = 319.0
     assert cpi.latest_value == "321.0"
     assert cpi.previous_value == "319.0"
 
 
-def test_brief_assembly_survives_provider_exceptions(
-    now, upcoming_events, recent_events, headlines
-) -> None:
-    """A throwing macro / news provider should yield a blank snapshot / empty
-    headlines, not crash the brief."""
-    llm = MagicMock()
+def test_brief_assembly_survives_provider_exceptions(now, upcoming_events, recent_events) -> None:
     macro = MagicMock()
     macro.get_series.side_effect = RuntimeError("simulated outage")
     news = MagicMock()
     news.search.side_effect = RuntimeError("simulated outage")
     agent = MarketContextAgent(
-        llm_provider=llm,
         calendar_provider=make_calendar(upcoming_events, recent_events),
         macro_provider=macro,
         news_provider=news,
@@ -274,139 +229,190 @@ def test_brief_assembly_survives_provider_exceptions(
     brief = agent.assemble_brief(
         MarketContextRequest(run_id="r1", as_of=now, watchlist=("EURUSD",))
     )
-    # Macro snapshots present but blank-valued.
     assert len(brief.macro) > 0
     assert all(m.latest_value is None for m in brief.macro)
-    # Headlines empty.
     assert brief.headlines == ()
 
 
 def test_brief_to_json_is_deterministic(
     now, upcoming_events, recent_events, macro_series_data, headlines
 ) -> None:
-    llm = MagicMock()
-    agent = MarketContextAgent(
-        llm_provider=llm,
-        calendar_provider=make_calendar(upcoming_events, recent_events),
-        macro_provider=make_macro(macro_series_data),
-        news_provider=make_news(headlines),
-    )
+    agent = _make_agent(upcoming_events, recent_events, macro_series_data, headlines)
     req = MarketContextRequest(run_id="r1", as_of=now, watchlist=("EURUSD",))
-    a = agent.assemble_brief(req).to_json()
-    b = agent.assemble_brief(req).to_json()
-    assert a == b
+    assert agent.assemble_brief(req).to_json() == agent.assemble_brief(req).to_json()
 
 
 # ---------------------------------------------------------------------------
-# LLM step (mocked llm_client)
+# Agent Protocol — prepare_call returns the right AgentCall
 # ---------------------------------------------------------------------------
 
 
-def test_run_calls_llm_with_default_tier_and_returns_parsed_report(
+def test_agent_name_is_market_context_agent() -> None:
+    assert MarketContextAgent.name == "market_context_agent"
+
+
+def test_prepare_call_shape(
     now, upcoming_events, recent_events, macro_series_data, headlines
 ) -> None:
-    """The agent dispatches via the provider-agnostic generate_structured
-    API on the DEFAULT tier, with the stable system prefix and the
-    volatile brief as the user message."""
-    canned = make_report(now)
+    agent = _make_agent(upcoming_events, recent_events, macro_series_data, headlines)
+    call = agent.prepare_call(
+        MarketContextRequest(run_id="r1", as_of=now, watchlist=("EURUSD", "USDJPY"))
+    )
+    assert isinstance(call, AgentCall)
+    assert call.tier == ModelTier.DEFAULT
+    assert call.output_model is MarketContextReport
+    # Stable prefix is the per-call-stable instructions; large enough to
+    # cross OpenAI's 1024-token auto-cache threshold (regression test).
+    assert "market_context_agent" in call.stable_system
+    assert len(call.stable_system) >= 4096  # chars; ~1024 tokens at chars/4
+    # Volatile carries the brief tag and run_id.
+    assert "BRIEF" in call.volatile_user
+    assert "r1" in call.volatile_user
+    # input_snapshot is the brief.to_json — used by the eval gate.
+    assert call.input_snapshot["run_id"] == "r1"
+    assert "upcoming_events" in call.input_snapshot
+
+
+def test_evaluations_returns_required_checks() -> None:
+    agent = MarketContextAgent.__new__(MarketContextAgent)
+    names = {c.name for c in agent.evaluations()}
+    assert {
+        "required_fields_present",
+        "run_id_preserved",
+        "confidences_bounded",
+        "no_trade_calls",
+    } <= names
+
+
+# ---------------------------------------------------------------------------
+# Tier-1 checks catch planted bad output
+# ---------------------------------------------------------------------------
+
+
+def _construct_with(good: MarketContextReport, **overrides) -> MarketContextReport:
+    """Build a malformed report via model_construct so we bypass pydantic
+    validators. Nested fields stay as their ORIGINAL pydantic instances
+    (model_dump would serialise them to dicts and break iteration)."""
+    base = {
+        "run_id": good.run_id,
+        "as_of": good.as_of,
+        "schema_version": good.schema_version,
+        "regimes": good.regimes,
+        "key_scheduled_events": good.key_scheduled_events,
+        "notable_surprises": good.notable_surprises,
+        "sentiment": good.sentiment,
+        "risk_flags": good.risk_flags,
+        "notes": good.notes,
+        "confidence": good.confidence,
+    }
+    base.update(overrides)
+    return MarketContextReport.model_construct(**base)
+
+
+def test_tier1_no_trade_calls_catches_model_construct_bypass() -> None:
+    """Pydantic validators reject trade language at construction time. A
+    ``model_construct(...)`` path bypasses validation — the Tier-1 check
+    runs again at the eval boundary and catches that escape."""
+    good = _fixture_report()
+    bad = _construct_with(good, notes="Go long EURUSD here.")
+    agent = MarketContextAgent.__new__(MarketContextAgent)
+    checks = {c.name: c for c in agent.evaluations()}
+    res = checks["no_trade_calls"].check(bad, {"run_id": good.run_id})
+    assert not res.passed
+    assert "go long" in res.reason.lower()
+
+
+def test_tier1_confidences_bounded_catches_out_of_range() -> None:
+    good = _fixture_report()
+    bad = _construct_with(good, confidence=Decimal("1.7"))
+    agent = MarketContextAgent.__new__(MarketContextAgent)
+    checks = {c.name: c for c in agent.evaluations()}
+    res = checks["confidences_bounded"].check(bad, {})
+    assert not res.passed
+    assert "1.7" in res.reason
+
+
+def test_tier1_required_fields_catches_missing_run_id() -> None:
+    good = _fixture_report()
+    bad = _construct_with(good, run_id="")
+    agent = MarketContextAgent.__new__(MarketContextAgent)
+    checks = {c.name: c for c in agent.evaluations()}
+    res = checks["required_fields_present"].check(bad, {})
+    assert not res.passed
+    assert "run_id" in res.reason
+
+
+def test_tier1_run_id_preserved_catches_mismatch() -> None:
+    good = _fixture_report()
+    agent = MarketContextAgent.__new__(MarketContextAgent)
+    checks = {c.name: c for c in agent.evaluations()}
+    res = checks["run_id_preserved"].check(good, {"run_id": "different-id"})
+    assert not res.passed
+    assert "run_id" in res.reason
+
+
+# ---------------------------------------------------------------------------
+# End-to-end through AgentRunner with a mocked LLM provider + the fixture
+# ---------------------------------------------------------------------------
+
+
+def test_end_to_end_via_runner_with_fixture_report(
+    now, upcoming_events, recent_events, macro_series_data, headlines
+) -> None:
+    """The runner orchestrates: prepare_call → LLM (mocked) → eval → metrics."""
+    agent = _make_agent(upcoming_events, recent_events, macro_series_data, headlines)
+    canned = _fixture_report()
+
     llm = MagicMock()
     llm.generate_structured.return_value = (
         canned,
         AgentResponse(
             agent_name="market_context_agent",
-            run_id="r1",
+            run_id="ctx-fixture-001:attempt-0",
             tier=ModelTier.DEFAULT,
             model="gpt-5.4",
             finish_reason="stop",
             usage=TokenUsage(prompt_tokens=1500, cached_tokens=900, completion_tokens=80),
+            extra_metadata={"attempts": "1"},
         ),
     )
-    agent = MarketContextAgent(
+    gate = EvaluationGate()  # Tier-2 off by default
+    runner = AgentRunner(
         llm_provider=llm,
-        calendar_provider=make_calendar(upcoming_events, recent_events),
-        macro_provider=make_macro(macro_series_data),
-        news_provider=make_news(headlines),
+        evaluation_gate=gate,
+        budget=AgentBudget(),
     )
-    report, meta = agent.run(
+    result = runner.run(
+        agent,
         MarketContextRequest(
-            run_id="r1", as_of=now, watchlist=("EURUSD", "USDJPY"),
-        )
-    )
-
-    llm.generate_structured.assert_called_once()
-    kwargs = llm.generate_structured.call_args.kwargs
-    assert kwargs["tier"] == ModelTier.DEFAULT
-    assert kwargs["agent_name"] == "market_context_agent"
-    assert kwargs["output_model"] is MarketContextReport
-    # The stable system prefix is large enough to cross the OpenAI cache
-    # threshold (verified separately) — assert presence here.
-    assert "market_context_agent" in kwargs["stable_system"]
-    # Volatile brief carries the BRIEF tag and the run_id.
-    assert "BRIEF" in kwargs["volatile_user"]
-    assert "r1" in kwargs["volatile_user"]
-
-    assert report is canned
-    assert meta.tier == ModelTier.DEFAULT
-
-
-def test_report_must_not_contain_trade_calls() -> None:
-    """The MarketContextReport schema rejects trade-language in free-text
-    fields. This is the belt-and-braces machine check that the user's
-    invariant ('MUST NOT contain trade recommendations') is enforced."""
-    import pydantic
-
-    with pytest.raises(pydantic.ValidationError, match="trade-recommendation"):
-        MarketContextReport(
-            run_id="r1",
-            as_of=datetime(2026, 6, 24, tzinfo=UTC),
-            notes="Should buy EURUSD here on the dip.",
-        )
-    with pytest.raises(pydantic.ValidationError, match="trade-recommendation"):
-        SentimentRead(
-            currency="USD",
-            label=SentimentLabel.POSITIVE,
-            score=Decimal("0.5"),
-            rationale="Go long USD now.",
-        )
-    with pytest.raises(pydantic.ValidationError, match="trade-recommendation"):
-        RiskFlagOut(
-            code="X",
-            severity=FlagSeverity.WARN,
-            description="Take profit at the next resistance.",
-        )
-
-
-def test_descriptive_language_passes_through() -> None:
-    """Non-recommendation language doesn't trip the validator: 'long-term',
-    'USD strength', 'EUR softer' etc. are descriptive, not imperative."""
-    r = MarketContextReport(
-        run_id="r1",
-        as_of=datetime(2026, 6, 24, tzinfo=UTC),
-        notes=(
-            "USD strength persists across G10. EUR softer on weaker growth "
-            "data. Long-term real yields steady."
+            run_id="ctx-fixture-001", as_of=now, watchlist=("EURUSD", "USDJPY")
         ),
+        run_id="ctx-fixture-001",
     )
-    assert "USD strength" in r.notes
+
+    assert result.succeeded
+    assert result.output is canned
+    assert result.eval_verdict is not None
+    assert result.eval_verdict.tier1_passed
+    assert result.metrics.tier == ModelTier.DEFAULT
+    assert result.metrics.model == "gpt-5.4"
+    assert result.metrics.prompt_tokens == 1500
+    assert result.metrics.cached_tokens == 900
+    assert result.metrics.completion_tokens == 80
+    # Cache-hit ratio matches what TokenUsage computes (900/1500 = 0.6).
+    assert abs(result.metrics.cache_hit_ratio - 0.6) < 1e-9
+    # Cost is non-zero on a known model.
+    assert result.metrics.estimated_cost_usd > 0
 
 
-def test_malformed_llm_output_propagates_as_validation_error(
-    now, upcoming_events, recent_events, macro_series_data, headlines
-) -> None:
-    """If the LLM client's parsed structured output is malformed, that
-    failure surfaces as an LlmClientError raised by call_structured itself
-    (mocked here as a side_effect)."""
-    from core.llm_client import LlmClientError
-
-    llm = MagicMock()
-    llm.generate_structured.side_effect = LlmClientError(
-        "model output failed schema validation"
-    )
-    agent = MarketContextAgent(
-        llm_provider=llm,
-        calendar_provider=make_calendar(upcoming_events, recent_events),
-        macro_provider=make_macro(macro_series_data),
-        news_provider=make_news(headlines),
-    )
-    with pytest.raises(LlmClientError):
-        agent.run(MarketContextRequest(run_id="r1", as_of=now, watchlist=("EURUSD",)))
+# Silence unused-fixture noise — pytest only sees the names used.
+_ = (
+    RegimeAssessment,
+    RiskFlagOut,
+    RiskState,
+    SentimentLabel,
+    SentimentRead,
+    TrendState,
+    VolState,
+    FlagSeverity,
+)

@@ -33,18 +33,21 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from core.agents.types import (
+    Agent,
+    AgentCall,
+    CheckResult,
+    StructuralCheck,
+)
 from core.context_data import (
     FRED_SERIES,
     EconomicCalendarProvider,
     MacroDataProvider,
     NewsProvider,
 )
-from core.llm_client import (
-    AgentResponse,
-    LLMProvider,
-    ModelTier,
-)
+from core.llm_client import ModelTier
 from core.models import (
+    _TRADE_CALL_PATTERNS,
     EconomicEvent,
     ImpactLevel,
     MacroSeriesPoint,
@@ -316,26 +319,66 @@ in the wrong agent.\
 
 
 class MarketContextAgent:
-    """Builds a brief from deterministic sources and asks the LLM to interpret it.
+    """Builds a brief from deterministic sources and prepares an LLM call.
 
-    Constructor takes the LLM provider and the three data providers. The
-    agent only ever reads — it never places orders or proposes strategies.
+    This agent implements the :class:`core.agents.types.Agent` Protocol.
+    It does **not** call the LLM directly — it builds an
+    :class:`AgentCall` that :class:`core.agents.runner.AgentRunner` issues
+    with timeout / retry / budget / evaluation around it.
+
+    Construction takes the three context-data providers; the LLM provider
+    is owned by the runner.
     """
+
+    name: str = "market_context_agent"
 
     def __init__(
         self,
         *,
-        llm_provider: LLMProvider,
         calendar_provider: EconomicCalendarProvider,
         macro_provider: MacroDataProvider,
         news_provider: NewsProvider,
         tier: ModelTier = ModelTier.DEFAULT,
     ) -> None:
-        self._llm = llm_provider
         self._calendar = calendar_provider
         self._macro = macro_provider
         self._news = news_provider
         self._tier = tier
+
+    # --------------------------------------------------------- Protocol
+
+    def prepare_call(self, inputs: MarketContextRequest) -> AgentCall:
+        """Build the :class:`AgentCall` for one run.
+
+        Pulls the brief from the three providers, then assembles the
+        volatile user message. The stable system prefix is a module
+        constant so OpenAI auto-caches it across calls.
+        """
+        brief = self.assemble_brief(inputs)
+        volatile_user = (
+            "Distil the following deterministic brief into a "
+            "MarketContextReport. Cite numbers from the brief; do not invent.\n\n"
+            f"BRIEF:\n{_pretty(brief.to_json())}"
+        )
+        return AgentCall(
+            stable_system=_STABLE_SYSTEM,
+            volatile_user=volatile_user,
+            tier=self._tier,
+            output_model=MarketContextReport,
+            max_output_tokens=4096,
+            input_snapshot=brief.to_json(),
+        )
+
+    def evaluations(self) -> tuple[StructuralCheck, ...]:
+        """Per-agent Tier-1 deterministic checks.
+
+        Defence-in-depth: the pydantic validators on
+        :class:`MarketContextReport` already reject most malformed
+        output; these run AGAIN at the eval boundary so a future
+        ``model_construct`` path or a schema-mismatched override is also
+        caught here.
+        """
+        return _TIER1_CHECKS
 
     # ----------------------------------------------------- brief assembly
 
@@ -405,35 +448,95 @@ class MarketContextAgent:
             for e in events
         )
 
-    # -------------------------------------------------------- LLM step
+# ---------------------------------------------------------------------------
+# Tier-1 evaluation checks
+# ---------------------------------------------------------------------------
 
-    def run(self, request: MarketContextRequest) -> tuple[MarketContextReport, AgentResponse]:
-        brief = self.assemble_brief(request)
-        return self.run_from_brief(brief)
 
-    def run_from_brief(
-        self, brief: MarketContextBrief
-    ) -> tuple[MarketContextReport, AgentResponse]:
-        """Call the LLM with an already-assembled brief.
-
-        Split from :meth:`run` so tests can drive the LLM step in isolation
-        from the providers, and so other agents (or replay) can reuse the
-        same prompt assembly without re-fetching.
-        """
-        volatile_user = (
-            "Distil the following deterministic brief into a "
-            "MarketContextReport. Cite numbers from the brief; do not invent.\n\n"
-            f"BRIEF:\n{_pretty(brief.to_json())}"
+def _check_run_id_preserved(
+    output: MarketContextReport, snapshot: dict[str, Any]
+) -> CheckResult:
+    expected = snapshot.get("run_id")
+    if expected is None:
+        return CheckResult(True)  # snapshot wasn't supplied; can't compare
+    if output.run_id != expected:
+        return CheckResult(
+            False, f"output run_id {output.run_id!r} != input {expected!r}"
         )
-        return self._llm.generate_structured(
-            agent_name="market_context_agent",
-            run_id=brief.run_id,
-            tier=self._tier,
-            stable_system=_STABLE_SYSTEM,
-            volatile_user=volatile_user,
-            output_model=MarketContextReport,
-            max_output_tokens=4096,
+    return CheckResult(True)
+
+
+def _check_confidences_bounded(
+    output: MarketContextReport, _snapshot: dict[str, Any]
+) -> CheckResult:
+    if not (0 <= output.confidence <= 1):
+        return CheckResult(
+            False, f"top-level confidence {output.confidence} out of [0,1]"
         )
+    for r in output.regimes:
+        if not (0 <= r.confidence <= 1):
+            return CheckResult(
+                False,
+                f"regime[{r.pair}].confidence {r.confidence} out of [0,1]",
+            )
+    for s in output.sentiment:
+        if not (-1 <= s.score <= 1):
+            return CheckResult(
+                False,
+                f"sentiment[{s.currency}].score {s.score} out of [-1,1]",
+            )
+    return CheckResult(True)
+
+
+def _check_no_trade_calls(
+    output: MarketContextReport, _snapshot: dict[str, Any]
+) -> CheckResult:
+    """Re-scan every free-text field for imperative trade language.
+
+    Pydantic's validators already reject construction with trade-call text,
+    but a ``model_construct(...)`` path bypasses validation — this catches
+    that escape hatch too.
+    """
+    spans: list[tuple[str, str]] = [("notes", output.notes)]
+    for r in output.regimes:
+        spans.append((f"regimes[{r.pair}].rationale", r.rationale))
+    for n in output.notable_surprises:
+        spans.append((f"notable_surprises[{n.name}].significance", n.significance))
+    for s in output.sentiment:
+        spans.append((f"sentiment[{s.currency}].rationale", s.rationale))
+    for f in output.risk_flags:
+        spans.append((f"risk_flags[{f.code}].description", f.description))
+    for field, text in spans:
+        for pattern in _TRADE_CALL_PATTERNS:
+            m = pattern.search(text)
+            if m:
+                return CheckResult(
+                    False, f"trade-recommendation language in {field}: {m.group()!r}"
+                )
+    return CheckResult(True)
+
+
+def _check_required_fields_present(
+    output: MarketContextReport, _snapshot: dict[str, Any]
+) -> CheckResult:
+    """Ensure run_id, as_of, and schema_version are non-empty / sane."""
+    if not output.run_id:
+        return CheckResult(False, "run_id is empty")
+    if output.schema_version != "1.0":
+        return CheckResult(False, f"schema_version {output.schema_version!r} != '1.0'")
+    return CheckResult(True)
+
+
+_TIER1_CHECKS: tuple[StructuralCheck, ...] = (
+    StructuralCheck(name="required_fields_present", check=_check_required_fields_present),
+    StructuralCheck(name="run_id_preserved", check=_check_run_id_preserved),
+    StructuralCheck(name="confidences_bounded", check=_check_confidences_bounded),
+    StructuralCheck(name="no_trade_calls", check=_check_no_trade_calls),
+)
+
+
+# Module-level sanity: every domain agent must implement Agent.
+_: Agent = MarketContextAgent.__new__(MarketContextAgent)  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
