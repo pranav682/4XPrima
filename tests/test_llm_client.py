@@ -367,9 +367,16 @@ def test_live_cheap_single_call() -> None:
     reason="RUN_LIVE_TESTS=1 and OPENAI_API_KEY must be set",
 )
 def test_live_default_caching_two_calls() -> None:
-    """Two identical-prefix DEFAULT-tier calls; second should show
-    cached_tokens > 0. The stable prefix is built to cross the 1024-token
-    OpenAI threshold."""
+    """Warm-up + identical-prefix retry: at least ONE second-call attempt
+    should show cached_tokens > 0.
+
+    Tolerates OpenAI's best-effort cache propagation (5-10 min retention,
+    no SLA on when the prefix becomes available) while still catching a
+    real regression that would prevent caching entirely — e.g. volatile
+    content leaking into the stable system prefix.
+    """
+    import time
+
     long_stable = (
         "You are the 4xPrima market_context_agent caching smoke tester. "
         * 250
@@ -377,27 +384,48 @@ def test_live_default_caching_two_calls() -> None:
     )
     settings = OpenAISettings()
     provider = OpenAIProvider(settings)
+
+    # Warm-up call — primes the cache.
     _, first = provider.generate_structured(
         agent_name="cache_smoke",
-        run_id="cache-test-1",
+        run_id="cache-test-warmup",
         tier=ModelTier.DEFAULT,
         stable_system=long_stable,
-        volatile_user="First call.",
+        volatile_user="Warm-up call.",
         output_model=TinyReport,
         max_output_tokens=256,
     )
-    _, second = provider.generate_structured(
-        agent_name="cache_smoke",
-        run_id="cache-test-2",
-        tier=ModelTier.DEFAULT,
-        stable_system=long_stable,
-        volatile_user="Second call.",
-        output_model=TinyReport,
-        max_output_tokens=256,
-    )
-    # The cache is best-effort; we don't assert exact numbers, only that the
-    # second call shows SOMETHING cached when the prefix re-occurs identically.
     assert first.usage.prompt_tokens > 0
-    assert second.usage.cached_tokens > 0, (
-        f"second call should hit cache; got {second.usage}"
+
+    # Up to 3 retries on the second call, sleeping briefly between attempts
+    # so OpenAI's cache propagation has a chance to land.
+    attempts: list[TokenUsage] = []
+    for attempt in range(3):
+        if attempt > 0:
+            time.sleep(2.0)
+        _, second = provider.generate_structured(
+            agent_name="cache_smoke",
+            run_id=f"cache-test-attempt-{attempt}",
+            tier=ModelTier.DEFAULT,
+            stable_system=long_stable,
+            volatile_user=f"Cached call attempt {attempt}.",
+            output_model=TinyReport,
+            max_output_tokens=256,
+        )
+        attempts.append(second.usage)
+        if second.usage.cached_tokens > 0:
+            print(
+                f"\nCACHE HIT on attempt {attempt}: "
+                f"cached_tokens={second.usage.cached_tokens} "
+                f"prompt_tokens={second.usage.prompt_tokens} "
+                f"hit_ratio={second.usage.cache_hit_ratio:.1%}"
+            )
+            return
+
+    pytest.fail(
+        f"no cache hit in {len(attempts)} attempts on an identical prefix. "
+        f"Usages: {attempts}. "
+        "This could be transient OpenAI cache propagation (retry test) OR a "
+        "real regression — check that nothing volatile (timestamps, run_id, "
+        "prices) is being interpolated into the stable system prefix."
     )
