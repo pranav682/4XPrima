@@ -189,6 +189,18 @@ def test_detect_gaps_counts_holes_not_weekends() -> None:
     ]
     assert detect_gaps(weekend, Granularity.D) == (0, 0)
 
+    # OANDA convention: daily bars are stamped at their 21:00 UTC open, so the
+    # pre-weekend ("Friday") bar is dated THURSDAY. Weekends must still NOT count
+    # — detection is by the Saturday in the span, not the start bar's weekday.
+    oanda_weekend = [
+        _candle("EURUSD", BASE + timedelta(days=1), "1.10"),  # Tue
+        _candle("EURUSD", BASE + timedelta(days=2), "1.10"),  # Wed
+        _candle("EURUSD", BASE + timedelta(days=3), "1.10"),  # Thu (Friday session)
+        _candle("EURUSD", BASE + timedelta(days=6), "1.10"),  # Sun (Monday session)
+        _candle("EURUSD", BASE + timedelta(days=7), "1.10"),  # Mon
+    ]
+    assert detect_gaps(oanda_weekend, Granularity.D) == (0, 0)
+
 
 # ---------------------------------------------------------------------------
 # Correlation matrix

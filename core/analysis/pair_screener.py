@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -198,10 +198,27 @@ def pearson(xs: Sequence[float], ys: Sequence[float]) -> float:
     return sxy / math.sqrt(sxx * syy)
 
 
-def _is_weekend_gap(start: datetime, delta_seconds: float) -> bool:
-    """A Fri/Sat-anchored interval no longer than ~3.2 days is the normal
-    forex weekend close, not missing data."""
-    return start.weekday() >= 4 and delta_seconds <= _WEEKEND_MAX_SECONDS
+def _spans_weekend(start: datetime, end: datetime) -> bool:
+    """True if the interval covers a Saturday — the hallmark of a forex weekend
+    close. Detecting weekends by content (a Saturday in the span) rather than by
+    the start bar's weekday is robust to candle-timestamp conventions: OANDA
+    stamps a daily bar at its 21:00 UTC *open*, so the pre-weekend ("Friday")
+    bar is dated Thursday, and a weekday-of-start check would miss every
+    weekend."""
+    day = start.date()
+    last = end.date()
+    while day <= last:
+        if day.weekday() == 5:  # Saturday
+            return True
+        day += timedelta(days=1)
+    return False
+
+
+def _is_weekend_gap(start: datetime, end: datetime) -> bool:
+    """A weekend-spanning interval no longer than ~3.2 days is the normal forex
+    weekend close, not missing data."""
+    delta = (end - start).total_seconds()
+    return delta <= _WEEKEND_MAX_SECONDS and _spans_weekend(start, end)
 
 
 def detect_gaps(candles: Sequence[Candle], granularity: Granularity) -> tuple[int, int]:
@@ -222,7 +239,7 @@ def detect_gaps(candles: Sequence[Candle], granularity: Granularity) -> tuple[in
         delta = (candles[i].time - candles[i - 1].time).total_seconds()
         if delta <= threshold:
             continue
-        if _is_weekend_gap(candles[i - 1].time, delta):
+        if _is_weekend_gap(candles[i - 1].time, candles[i].time):
             continue
         gap_count += 1
         missing = max(0, round(delta / nominal) - 1)
