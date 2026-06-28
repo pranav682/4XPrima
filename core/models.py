@@ -45,7 +45,7 @@ class DecisionKind(StrEnum):
     """Outcome of one ``RiskManager.evaluate`` call."""
 
     APPROVE = "approve"
-    RESIZE = "resize"   # approved, but size was clipped down by a cap
+    RESIZE = "resize"  # approved, but size was clipped down by a cap
     REJECT = "reject"
 
 
@@ -181,12 +181,12 @@ class AccountState(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    balance: Decimal                 # cash balance, may be negative if margin-called
-    equity: Decimal                  # balance + unrealized_pnl; the working number
+    balance: Decimal  # cash balance, may be negative if margin-called
+    equity: Decimal  # balance + unrealized_pnl; the working number
     open_positions: tuple[Position, ...] = ()
     realized_pnl_today: Decimal = Decimal("0")
     unrealized_pnl: Decimal = Decimal("0")
-    peak_equity: PositiveDecimal      # rolling all-time peak, for drawdown
+    peak_equity: PositiveDecimal  # rolling all-time peak, for drawdown
     day_start_equity: PositiveDecimal  # for the daily loss limit
     as_of: datetime
 
@@ -301,8 +301,8 @@ class EconomicEvent(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    when: datetime                # UTC, the release time
-    currency: str                 # ISO-4217: "USD", "EUR", "GBP", ...
+    when: datetime  # UTC, the release time
+    currency: str  # ISO-4217: "USD", "EUR", "GBP", ...
     name: str
     impact: ImpactLevel
 
@@ -367,11 +367,11 @@ class NewsEvent(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    timestamp: datetime           # UTC
+    timestamp: datetime  # UTC
     title: str
-    source: str                   # domain or publication
+    source: str  # domain or publication
     url: str
-    tone: Decimal | None = None   # GDELT scale: roughly -100..+100
+    tone: Decimal | None = None  # GDELT scale: roughly -100..+100
     themes: tuple[str, ...] = ()
     entities: tuple[str, ...] = ()
 
@@ -751,9 +751,7 @@ class RiskConfig(BaseModel):
 
     @field_validator("correlation_groups")
     @classmethod
-    def _normalize_groups(
-        cls, v: dict[str, tuple[str, ...]]
-    ) -> dict[str, tuple[str, ...]]:
+    def _normalize_groups(cls, v: dict[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
         # Normalise pair codes to upper-case for predictable membership tests.
         return {gname: tuple(p.upper() for p in pairs) for gname, pairs in v.items()}
 
@@ -779,7 +777,7 @@ class RiskDecision(BaseModel):
     kind: DecisionKind
     sized_order: OrderRequest | None
     rejected_by: tuple[RejectionReason, ...] = ()
-    reason: str                              # human-readable
+    reason: str  # human-readable
     limiting_rule: RejectionReason | None = None
     config_hash: str
     as_of: datetime
