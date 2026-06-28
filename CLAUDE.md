@@ -36,12 +36,23 @@ If you find yourself about to type a literal token into a command line, STOP. Lo
 ## Coding conventions
 
 - **Python 3.11+** (Agent SDK requires ≥3.10; we go 3.11 for `Self`, exception groups, perf).
-- **Full type hints** on every function and class. `mypy --strict` clean is the goal.
+- **Full type hints** on every function and class. See the `mypy --strict` policy below.
 - **Formatting:** `black`. **Linting:** `ruff` (includes import sort, pyupgrade, bugbear, etc.).
 - **Tests:** `pytest` with `pytest-asyncio`. Backtest math has unit tests; agent specs have schema tests.
 - **Logging:** structured (JSON) via `structlog`. Every LLM call logs `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, `output_tokens`, `model`, `agent_name`, `run_id`.
 - **Config:** `pydantic-settings` reading from environment / `.env`. No hardcoded paths, hosts, or limits in code.
 - **Data:** time series are timezone-aware UTC; prices are `Decimal` at boundaries, `float64` numpy inside hot loops with explicit narrowing.
+
+## Type checking (`mypy --strict`) — a ratchet, not a blanket claim
+
+`mypy --strict` is **not** repo-wide clean and never has been (don't claim otherwise). We enforce it as a **ratchet** on completed code:
+
+- **Enforced-clean set** — must stay `--strict` clean; `scripts/typecheck.sh` fails on any new error here:
+  `core/models.py`, `core/strategy.py`, `core/backtest/`, `core/broker.py`, `core/config.py`, `core/usage_accounting.py`.
+- **Every NEW module must land `--strict` clean** and be added to the enforced set (`ENFORCED` in `scripts/typecheck.sh`).
+- **Known debt — NOT yet enforced:** the rest of the fast loop (`core/risk_manager.py`, `core/execution.py`, `core/paper_broker.py`, `core/market_data.py` — small, mostly the untyped-`structlog` return), the data/LLM adapters (`core/context_data.py`, `core/llm_client.py`), the slow-loop agents (`core/agents/*` except the already-clean `cost.py`/`types.py`), and most of `tests/`. Full per-package inventory + ratchet in **`docs/type-debt.md`**.
+
+**Run the gate:** `scripts/typecheck.sh`. As a package is cleaned and stabilises, add it to `ENFORCED` and delete its row from `docs/type-debt.md`. Do not add a package while it still has errors.
 
 ## Required reading before implementing anything
 
