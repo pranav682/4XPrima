@@ -116,6 +116,55 @@ class PeekingStrategy:
         return []
 
 
+class TwoSignalSameBarStrategy:
+    """Emits two same-direction orders in a single ``decide()``, once.
+
+    Used to reach the in-evaluate kill-switch path: opening the first lot can
+    push drawdown past the cap, so the SECOND order's risk evaluation is the
+    thing that trips the switch (mid-bar, not via the top-of-bar guard)."""
+
+    name = "two_signal_same_bar"
+
+    def __init__(
+        self,
+        *,
+        size: Decimal,
+        stop_distance: Decimal = Decimal("0.05"),
+        trigger_len: int = 2,
+    ) -> None:
+        self._size = size
+        self._stop_distance = stop_distance
+        self._trigger_len = trigger_len
+        self._fired = False
+
+    def params(self) -> dict[str, Any]:
+        return {
+            "size": str(self._size),
+            "stop_distance": str(self._stop_distance),
+            "trigger_len": self._trigger_len,
+        }
+
+    def decide(
+        self,
+        bars: PointInTimeView,
+        account: AccountState,
+        *,
+        as_of: datetime,
+    ) -> list[OrderRequest]:
+        if self._fired or len(bars) != self._trigger_len:
+            return []
+        self._fired = True
+        close = bars.latest.close
+        order = OrderRequest(
+            pair="EURUSD",
+            direction=Direction.LONG,
+            size=self._size,
+            entry_price=close,
+            stop_price=close - self._stop_distance,
+        )
+        return [order, order]
+
+
 # ---------------------------------------------------------------------------
 # 1. Look-ahead / next-bar-open fill
 # ---------------------------------------------------------------------------
@@ -318,6 +367,46 @@ def test_drawdown_breach_trips_kill_switch_and_flattens(
     assert result.equity_curve[-1].open_positions == 0
     # Realized the modelled loss: (1.05 - 1.10) * 100000 = -5000 (zero cost).
     assert result.trade_log[0].realized_pnl == Decimal("-5000.00")
+
+
+def test_kill_switch_tripped_inside_evaluate_halts_mid_bar(
+    make_bars: Callable[..., list[Candle]],
+) -> None:
+    # Proves the in-evaluate halt branch is genuinely reachable (mypy mis-reads
+    # it as unreachable). A wide half-spread makes opening the first lot show an
+    # immediate large unrealized loss; the re-snapshot pushes drawdown past the
+    # 5% cap, so the SECOND same-bar order's evaluate() trips the kill switch.
+    wide_spread = CostModel(
+        half_spread=Decimal("0.01"),
+        commission_per_unit=Decimal("0"),
+        slippage_per_unit=Decimal("0"),
+        swap_long_per_unit_per_day=Decimal("0"),
+        swap_short_per_unit_per_day=Decimal("0"),
+    )
+    cfg = _config(
+        max_drawdown_pct=Decimal("0.05"),
+        max_risk_per_trade_pct=Decimal("1"),
+        max_portfolio_risk_pct=Decimal("1"),
+    )
+    bars = make_bars(["1.10", "1.10", "1.10", "1.10"])
+    strat = TwoSignalSameBarStrategy(size=Decimal("50000"), stop_distance=Decimal("0.05"))
+    result = BacktestEngine(
+        bars=bars,
+        strategy=strat,
+        risk_config=cfg,
+        cost_model=wide_spread,
+        starting_balance=Decimal("10000"),
+    ).run()
+
+    assert result.halted_due_to_kill_switch is True
+    assert result.halt_reason is not None
+    assert "during evaluate" in result.halt_reason
+    # First order opened (then flattened on halt); the second was rejected by
+    # the kill switch that its own evaluation tripped.
+    assert result.n_signals_proposed == 2
+    assert result.n_signals_accepted == 1
+    assert result.n_signals_rejected == 1
+    assert result.equity_curve[-1].open_positions == 0
 
 
 # ---------------------------------------------------------------------------

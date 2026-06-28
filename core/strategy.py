@@ -28,7 +28,7 @@ Signal timing convention:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -89,7 +89,7 @@ class PointInTimeView:
     def __len__(self) -> int:
         return len(self._visible)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Candle]:
         return iter(self._visible)
 
     # ----------------------------------------------------------- access

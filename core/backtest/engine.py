@@ -30,7 +30,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -54,6 +54,7 @@ from core.models import (
     Direction,
     OrderRequest,
     Position,
+    RejectionReason,
     RiskConfig,
 )
 from core.risk_manager import RiskManager
@@ -542,8 +543,17 @@ class BacktestEngine:
                 decision = risk_manager.evaluate(sig, account)
                 if not decision.accepted or decision.sized_order is None:
                     n_rejected += 1
-                    if risk_manager.kill_switch_engaged:
-                        # Drawdown/daily-loss tripped INSIDE evaluate().
+                    # evaluate() can trip the kill switch itself — a drawdown or
+                    # daily-loss breach measured on the account we just passed
+                    # (e.g. an earlier signal this bar opened a lot that pushed
+                    # equity past the cap). When it does, the rejection carries
+                    # RejectionReason.KILL_SWITCH. We read it off the decision
+                    # rather than re-checking risk_manager.kill_switch_engaged:
+                    # the step-5 guard above narrowed that property to False, and
+                    # mypy can't see evaluate()'s side effect on it (it would
+                    # flag this branch as unreachable). The decision is also the
+                    # more precise signal — it's THIS evaluation's verdict.
+                    if RejectionReason.KILL_SWITCH in decision.rejected_by:
                         halted = True
                         halted_at = t
                         halt_reason = f"kill switch tripped during evaluate at bar {t}"
@@ -800,7 +810,9 @@ def _default_logger() -> structlog.stdlib.BoundLogger:
             logger_factory=structlog.PrintLoggerFactory(),
             cache_logger_on_first_use=True,
         )
-    return structlog.get_logger("core.backtest.engine")
+    # structlog.get_logger is untyped (-> Any); narrow to the BoundLogger the
+    # rest of the module is annotated against.
+    return cast("structlog.stdlib.BoundLogger", structlog.get_logger("core.backtest.engine"))
 
 
 # Tag unused import to keep ruff quiet for the timezone helper kept for

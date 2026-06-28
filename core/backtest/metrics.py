@@ -17,6 +17,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only imports: avoids the runtime types.py <-> metrics.py import
+    # cycle (types.py imports BacktestMetrics from here). Safe because
+    # `from __future__ import annotations` makes every annotation a string.
+    from core.backtest.types import EquityPoint, TradeRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,20 +53,20 @@ class BacktestMetrics:
 # ---------------------------------------------------------------------------
 
 
-def infer_periods_per_year(times: Sequence[object]) -> float:
-    """Estimate bars-per-year from a sequence of equity-point times.
+def infer_periods_per_year(points: Sequence[EquityPoint]) -> float:
+    """Estimate bars-per-year from a sequence of equity points.
 
     Uses a 252-trading-day year (standard for forex / equities). Falls
     back to 252 (daily) for too-few-bars inputs.
     """
-    if len(times) < 2:
+    if len(points) < 2:
         return 252.0
-    first = getattr(times[0], "time", times[0])
-    last = getattr(times[-1], "time", times[-1])
+    first = points[0].time
+    last = points[-1].time
     delta_seconds = (last - first).total_seconds()
     if delta_seconds <= 0:
         return 252.0
-    avg_seconds = delta_seconds / (len(times) - 1)
+    avg_seconds = delta_seconds / (len(points) - 1)
     if avg_seconds <= 0:
         return 252.0
     seconds_per_year = 252.0 * 24.0 * 3600.0
@@ -76,8 +83,8 @@ def _floats(values: Sequence[Decimal]) -> list[float]:
 
 
 def compute_metrics(
-    equity_curve: Sequence,  # EquityPoint sequence
-    trade_log: Sequence,  # TradeRecord sequence
+    equity_curve: Sequence[EquityPoint],
+    trade_log: Sequence[TradeRecord],
     *,
     periods_per_year: float | None = None,
 ) -> BacktestMetrics:
@@ -149,20 +156,21 @@ def compute_metrics(
             if dd > max_dd:
                 max_dd = dd
 
-    # 5. Trade metrics from the closed trades.
-    closed = [t for t in trade_log if t.realized_pnl is not None]
-    if closed:
-        wins = [t for t in closed if t.realized_pnl > 0]
-        losses = [t for t in closed if t.realized_pnl < 0]
-        win_rate = len(wins) / len(closed)
-        gross_wins = sum((t.realized_pnl for t in wins), Decimal("0"))
-        gross_losses_abs = abs(sum((t.realized_pnl for t in losses), Decimal("0")))
+    # 5. Trade metrics from the closed trades. Pull the realized PnLs out into
+    #    a list[Decimal] up front so the rest of the block is None-free.
+    closed_pnls: list[Decimal] = [t.realized_pnl for t in trade_log if t.realized_pnl is not None]
+    if closed_pnls:
+        wins = [p for p in closed_pnls if p > 0]
+        losses = [p for p in closed_pnls if p < 0]
+        win_rate = len(wins) / len(closed_pnls)
+        gross_wins = sum(wins, Decimal("0"))
+        gross_losses_abs = abs(sum(losses, Decimal("0")))
         if gross_losses_abs > 0:
             profit_factor = float(gross_wins / gross_losses_abs)
         else:
             profit_factor = float("inf") if gross_wins > 0 else 0.0
-        avg_trade = sum((t.realized_pnl for t in closed), Decimal("0")) / Decimal(len(closed))
-        trade_count = len(closed)
+        avg_trade = sum(closed_pnls, Decimal("0")) / Decimal(len(closed_pnls))
+        trade_count = len(closed_pnls)
     else:
         win_rate = 0.0
         profit_factor = 0.0
