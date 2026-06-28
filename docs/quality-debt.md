@@ -8,9 +8,9 @@
 > black-clean, and mypy --strict-clean.**
 
 See `CLAUDE.md` → "Quality gate" for the policy. The enforced-clean set today is
-`core/models.py`, `core/strategy.py`, `core/backtest/`, `core/broker.py`,
-`core/config.py`, `core/usage_accounting.py` — clean under all three tools, and
-`scripts/check.sh` keeps it that way.
+`core/models.py`, `core/strategy.py`, `core/backtest/`, `core/analysis/`,
+`core/broker.py`, `core/config.py`, `core/usage_accounting.py` — clean under all
+three tools, and `scripts/check.sh` keeps it that way.
 
 ## How to read this
 

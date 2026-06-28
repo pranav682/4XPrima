@@ -92,6 +92,7 @@ def _require_utc(value: datetime) -> datetime:
 
 PositiveDecimal = Annotated[Decimal, Field(gt=Decimal("0"))]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=Decimal("0"))]
+NonNegativeInt = Annotated[int, Field(ge=0)]
 LossPercentDecimal = Annotated[Decimal, Field(gt=Decimal("0"), le=Decimal("1"))]
 """A loss-side fractional percent in (0, 1] — used for caps that measure a
 loss against equity (per-trade risk, portfolio risk, daily loss, drawdown).
@@ -791,3 +792,62 @@ class RiskDecision(BaseModel):
     def accepted(self) -> bool:
         """True iff the decision admits a (possibly resized) order."""
         return self.kind in (DecisionKind.APPROVE, DecisionKind.RESIZE)
+
+
+class PairProfile(BaseModel):
+    """Structural characterisation of a single pair over a lookback window.
+
+    **This profile contains NO measure of historical return, expected profit,
+    or any performance score — by design.** Selecting a trading universe by
+    past return is selection bias; profitability is decided later by the
+    backtester + out-of-sample + critic, never here. Every field is structural:
+    data completeness, dispersion/range, cost-to-move, and behaviour
+    descriptors.
+
+    The behaviour descriptors (``autocorrelations``, ``variance_ratio``,
+    ``behavior_descriptor``) are **descriptive and regime-dependent, NOT
+    predictive** — they characterise how the series moved in-sample and must
+    not be read as a forecast of future direction or profit.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pair: str
+    granularity: Granularity
+
+    # --- Data coverage / completeness ---
+    candle_count: NonNegativeInt
+    expected_count: NonNegativeInt
+    coverage_ratio: Decimal  # candle_count / expected_count, clamped to [0, 1]
+    gap_count: NonNegativeInt  # inter-candle intervals beyond normal cadence
+    largest_gap_bars: NonNegativeInt  # biggest single gap, in missing-bar units
+    window_start: datetime | None
+    window_end: datetime | None
+
+    # --- Dispersion / range (magnitude of movement, NOT direction or profit) ---
+    last_close: Decimal
+    atr: Decimal  # average true range, price units
+    atr_pct: Decimal  # atr / last_close (fraction)
+    realized_vol_annualized: float  # annualised stdev of per-bar simple returns
+
+    # --- Cost-to-move ---
+    spread: Decimal | None  # current bid/ask spread, price units (None if no quote)
+    spread_to_atr: Decimal | None  # spread / atr; larger = costlier to move
+
+    # --- Behaviour descriptors: DESCRIPTIVE & REGIME-DEPENDENT, NOT predictive ---
+    autocorrelations: tuple[tuple[int, float], ...]  # (lag, coefficient) pairs
+    variance_ratio: float
+    variance_ratio_horizon: int
+    behavior_descriptor: str
+
+    @field_validator("pair")
+    @classmethod
+    def _normalize_pair(cls, v: str) -> str:
+        if not v or not v.isalpha():
+            raise ValueError("pair must be alphabetic, e.g. 'EURUSD'")
+        return v.upper()
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _utc_only(cls, v: datetime | None) -> datetime | None:
+        return None if v is None else _require_utc(v)

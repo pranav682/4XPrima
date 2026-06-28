@@ -30,6 +30,7 @@ ENFORCED=(
   core/models.py            # frozen domain models
   core/strategy.py          # strategy contract + reference strategy
   core/backtest/            # deterministic backtester
+  core/analysis/            # structural pair screener
   core/broker.py            # broker Protocol
   core/config.py            # pydantic-settings config
   core/usage_accounting.py  # per-agent token/cache log

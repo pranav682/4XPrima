@@ -65,6 +65,11 @@ Treat each numbered check as a named test. Each must produce a `CriticCheckResul
 - **Pass:** drawdown recovery time ≤ 2× the average winning-period duration (no eternal underwater).
 - **Why:** survivability matters as much as ending P&L.
 
+### 9. Universe selection bias
+
+- **Pass:** the candidate's trading universe was narrowed by **structural screening** (data sufficiency, cost-to-move, low mutual correlation — see `core/analysis/pair_screener.py`), **never by historical return**. Picking the pairs that happened to pay the most in-sample is selection bias and pre-bakes the overfit.
+- **Why:** profitability is decided here (backtest + OOS + this critic), not at universe-selection time. A universe chosen by past return has already snooped the answer.
+
 ## Output format
 
 ```python
