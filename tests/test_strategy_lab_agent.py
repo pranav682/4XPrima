@@ -79,24 +79,28 @@ def _context(run_id: str = "lab-fixture-001") -> MarketContextReport:
     )
 
 
-def _params(fast: str = "12", slow: str = "48") -> tuple[StrategyParam, ...]:
+def _params(fast: str = "12", slow: str = "48", stop_pips: str = "70") -> tuple[StrategyParam, ...]:
+    # Realistic stops are in PIPS now (70 pips on a JPY pair, not 0.004 price).
     return (
         StrategyParam(name="fast_period", value=Decimal(fast)),
         StrategyParam(name="slow_period", value=Decimal(slow)),
         StrategyParam(name="size", value=Decimal("1000")),
-        StrategyParam(name="stop_distance", value=Decimal("0.004")),
+        StrategyParam(name="stop_distance_pips", value=Decimal(stop_pips)),
     )
 
 
 def _ranges(
     fast: tuple[str, str] = ("5", "30"),
     slow: tuple[str, str] = ("30", "120"),
+    stop_pips: tuple[str, str] = ("40", "120"),
 ) -> tuple[ParamRange, ...]:
     return (
         ParamRange(name="fast_period", low=Decimal(fast[0]), high=Decimal(fast[1])),
         ParamRange(name="slow_period", low=Decimal(slow[0]), high=Decimal(slow[1])),
         ParamRange(name="size", low=Decimal("500"), high=Decimal("2000")),
-        ParamRange(name="stop_distance", low=Decimal("0.002"), high=Decimal("0.01")),
+        ParamRange(
+            name="stop_distance_pips", low=Decimal(stop_pips[0]), high=Decimal(stop_pips[1])
+        ),
     )
 
 
@@ -211,6 +215,61 @@ def test_valid_candidate_is_constructible_into_real_strategy() -> None:
     for name, fn in checks.items():
         res = fn(proposal, snap)
         assert res.passed, f"{name}: {res.reason}"
+
+
+# ---------------------------------------------------------------------------
+# Pip-relative stop bound — regression for the absolute-price-units bug that
+# locked JPY pairs out of every proposal (surfaced by a live run). Uses
+# REALISTIC per-pair stops, not conveniently-small ones (that masking is why
+# the original hermetic suite missed it).
+# ---------------------------------------------------------------------------
+
+
+def _all_tier1_pass(candidate: StrategyCandidate) -> None:
+    snap = _snapshot()
+    for name, fn in _checks().items():
+        res = fn(_proposal((candidate,)), snap)
+        assert res.passed, f"{name}: {res.reason}"
+
+
+def test_realistic_usdjpy_80pip_stop_passes_and_constructs() -> None:
+    # 80 pips on USDJPY = 0.80 in price units — would have FAILED the old
+    # [0.0001, 0.5] absolute cap. Now it passes and constructs.
+    candidate = _candidate(
+        instrument="USDJPY",
+        parameters=_params(stop_pips="80"),
+        parameter_ranges=_ranges(stop_pips=("40", "120")),
+    )
+    _all_tier1_pass(candidate)
+    strategy = build_strategy(candidate)
+    assert isinstance(strategy, MovingAverageCrossover)
+    assert strategy.params()["stop_distance"] == "0.80"  # 80 * 0.01 pip size
+
+
+def test_realistic_eurusd_50pip_stop_passes_and_constructs() -> None:
+    candidate = _candidate(
+        instrument="EURUSD",
+        parameters=_params(stop_pips="50"),
+        parameter_ranges=_ranges(stop_pips=("30", "80")),
+    )
+    _all_tier1_pass(candidate)
+    strategy = build_strategy(candidate)
+    assert isinstance(strategy, MovingAverageCrossover)
+    assert strategy.params()["stop_distance"] == "0.0050"  # 50 * 0.0001 pip size
+
+
+@pytest.mark.parametrize("pair", ["USDJPY", "EURUSD"])
+def test_absurd_1000pip_stop_rejects_on_both_pair_types(pair: str) -> None:
+    # 1000 pips is genuinely absurd on either pair type — it must still reject,
+    # so the pip relaxation didn't just disable the bound.
+    bad = _candidate(
+        instrument=pair,
+        parameters=_params(stop_pips="1000"),
+        parameter_ranges=_ranges(stop_pips=("500", "1500")),
+    )
+    res = _checks()["params_and_ranges_sane"](_proposal((bad,)), _snapshot())
+    assert not res.passed
+    assert "stop_distance_pips" in res.reason
 
 
 # ---------------------------------------------------------------------------

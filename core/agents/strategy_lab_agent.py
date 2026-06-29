@@ -160,16 +160,16 @@ OUTPUT EXAMPLE (shape, NOT content — copy structure, not values):
         {"name": "fast_period", "value": "12"},
         {"name": "slow_period", "value": "48"},
         {"name": "size", "value": "1000"},
-        {"name": "stop_distance", "value": "0.004"}
+        {"name": "stop_distance_pips", "value": "70"}
       ],
       "parameter_ranges": [
         {"name": "fast_period", "low": "5", "high": "30"},
         {"name": "slow_period", "low": "30", "high": "120"},
         {"name": "size", "low": "500", "high": "2000"},
-        {"name": "stop_distance", "low": "0.002", "high": "0.01"}
+        {"name": "stop_distance_pips", "low": "40", "high": "120"}
       ],
       "rationale": "Context tags USDJPY trending_up with elevated vol; a \
-fast/slow crossover rides continuation. Stop sized to recent ATR band."
+fast/slow crossover rides continuation. Stop in pips (70) suits a JPY pair."
     }
   ]
 }

@@ -8,7 +8,7 @@
       "run_id": "lab-fixture-001",
       "archetype": "ma_crossover",
       "instrument": "USDJPY",
-      "timeframe": "H1",
+      "timeframe": "H4",
       "parameters": [
         {
           "name": "fast_period",
@@ -23,8 +23,8 @@
           "value": "1000"
         },
         {
-          "name": "stop_distance",
-          "value": "0.004"
+          "name": "stop_distance_pips",
+          "value": "70"
         }
       ],
       "parameter_ranges": [
@@ -44,12 +44,12 @@
           "high": "2000"
         },
         {
-          "name": "stop_distance",
-          "low": "0.002",
-          "high": "0.01"
+          "name": "stop_distance_pips",
+          "low": "40",
+          "high": "120"
         }
       ],
-      "rationale": "Context tags USDJPY trending_up with elevated vol; a fast/slow crossover rides the continuation. Stop sized to the recent ATR band."
+      "rationale": "Context tags USDJPY trending_up with elevated vol; a fast/slow crossover rides the continuation. Stop in pips (70) suits a JPY pair."
     }
   ]
 }

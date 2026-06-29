@@ -297,15 +297,34 @@ class MovingAverageCrossover:
 # ---------------------------------------------------------------------------
 
 
+def pip_size(pair: str) -> Decimal:
+    """Price increment of one pip for ``pair``.
+
+    JPY-quoted pairs (USDJPY, EURJPY, …) use ``0.01``; everything else uses
+    ``0.0001``. The quote currency is the last three letters. This is the
+    convention that makes ``stop_distance`` limits **price-relative** instead of
+    absolute: a 50-pip stop is 0.005 on EURUSD but 0.5 on USDJPY, yet both are
+    "50 pips". Exotic / metals conventions are out of scope for now.
+    """
+    return Decimal("0.01") if pair.upper().endswith("JPY") else Decimal("0.0001")
+
+
 @dataclass(frozen=True, slots=True)
 class ParamSpec:
     """Hard limits for one archetype parameter — the outer fence the agent's
-    proposed ``parameter_ranges`` must sit inside."""
+    proposed ``parameter_ranges`` must sit inside.
+
+    ``unit`` is documentation only (rendered into the agent's catalog so it
+    proposes in the right units). Limits for a pip-denominated parameter (e.g.
+    ``stop_distance_pips``) are themselves in PIPS, so they are pair-independent
+    — the per-pair conversion to price units happens in the archetype builder.
+    """
 
     name: str
     minimum: Decimal
     maximum: Decimal
     integer: bool
+    unit: str = "unitless"
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,12 +346,16 @@ class ArchetypeSpec:
 
 
 def _build_ma_crossover(instrument: str, params: dict[str, Decimal]) -> Strategy:
+    # `stop_distance_pips` is in PIPS; convert to price units per the pair's pip
+    # size before constructing the (price-unit) strategy. This is the single
+    # place the pip→price conversion lives.
+    stop_price_units = params["stop_distance_pips"] * pip_size(instrument)
     return MovingAverageCrossover(
         pair=instrument,
         fast_period=int(params["fast_period"]),
         slow_period=int(params["slow_period"]),
         size=params["size"],
-        stop_distance=params["stop_distance"],
+        stop_distance=stop_price_units,
     )
 
 
@@ -342,13 +365,30 @@ STRATEGY_REGISTRY: dict[StrategyArchetype, ArchetypeSpec] = {
         description=(
             "Moving-average crossover. Long when the fast MA crosses above the "
             "slow MA, short on the reverse cross. Single pair, fixed size, "
-            "fixed-distance stop. Requires fast_period < slow_period."
+            "stop in PIPS. Requires fast_period < slow_period."
         ),
         param_specs=(
-            ParamSpec("fast_period", Decimal("2"), Decimal("200"), integer=True),
-            ParamSpec("slow_period", Decimal("3"), Decimal("400"), integer=True),
-            ParamSpec("size", Decimal("1"), Decimal("10000000"), integer=False),
-            ParamSpec("stop_distance", Decimal("0.0001"), Decimal("0.5"), integer=False),
+            ParamSpec("fast_period", Decimal("2"), Decimal("200"), integer=True, unit="bars"),
+            ParamSpec("slow_period", Decimal("3"), Decimal("400"), integer=True, unit="bars"),
+            # size is a COUNT of base-currency units — pair-independent, not a
+            # price — so its limits don't suffer the absolute-vs-relative trap.
+            ParamSpec(
+                "size",
+                Decimal("1"),
+                Decimal("10000000"),
+                integer=False,
+                unit="base-currency units",
+            ),
+            # Pip-denominated → pair-independent limits. 5..500 pips covers every
+            # realistic stop (a 30-pip EURUSD scalp through a 300-pip swing) on
+            # both 0.0001-pip and 0.01-pip (JPY) pairs.
+            ParamSpec(
+                "stop_distance_pips",
+                Decimal("5"),
+                Decimal("500"),
+                integer=False,
+                unit="pips",
+            ),
         ),
         builder=_build_ma_crossover,
     ),
@@ -358,14 +398,26 @@ STRATEGY_REGISTRY: dict[StrategyArchetype, ArchetypeSpec] = {
 def archetype_catalog() -> str:
     """Deterministic human-readable catalog of the registry, for the agent's
     stable system prefix. Byte-stable across processes (sorted), so it doesn't
-    break OpenAI prompt caching."""
-    lines: list[str] = []
+    break OpenAI prompt caching.
+
+    Each parameter renders with its UNIT so the proposer reasons in the right
+    units. In particular ``stop_distance_pips`` is in PIPS, NOT price units —
+    the limits are pair-independent and the engine converts pips to price using
+    1 pip = 0.0001 (or 0.01 for JPY-quoted pairs)."""
+    lines: list[str] = [
+        "Units note: parameter limits are stated in each parameter's own unit. "
+        "stop_distance_pips is in PIPS (1 pip = 0.0001, or 0.01 for JPY-quoted "
+        "pairs like USDJPY), so the SAME pip range fits every pair; do not "
+        "propose stops in raw price units. size is a count of base-currency "
+        "units; periods are in bars.",
+        "",
+    ]
     for archetype in sorted(STRATEGY_REGISTRY, key=lambda a: a.value):
         spec = STRATEGY_REGISTRY[archetype]
         lines.append(f"- {archetype.value}: {spec.description}")
         for ps in spec.param_specs:
             kind = "integer" if ps.integer else "decimal"
-            lines.append(f"    * {ps.name} ({kind}) in [{ps.minimum}, {ps.maximum}]")
+            lines.append(f"    * {ps.name} ({kind}, {ps.unit}) in [{ps.minimum}, {ps.maximum}]")
     return "\n".join(lines)
 
 
@@ -446,5 +498,6 @@ __all__ = [
     "Strategy",
     "archetype_catalog",
     "build_strategy",
+    "pip_size",
     "validate_candidate",
 ]
