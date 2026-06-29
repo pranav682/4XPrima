@@ -1,16 +1,17 @@
 """Deterministic backtest harness — runs the Stage-2 engine, NO LLM.
 
-This is the compute half of backtest_agent: it turns a
-:class:`core.models.StrategyProposal` into one
-:class:`core.models.BacktestEvidence` per candidate by building the real
-strategy and running the deterministic Stage-2 engine over the **in-sample**
-window. The LLM never runs here and never produces a number — it only
-interprets the evidence this module computes.
+The compute half of backtest_agent AND critic_agent: it builds the real
+strategy and runs the deterministic Stage-2 engine, turning a candidate into
+:class:`core.models.BacktestEvidence` / :class:`core.models.RobustnessEvidence`.
+The LLM never runs here and never produces a number — it only interprets the
+evidence this module computes.
 
-In-sample only. The held-out OOS slice is taken via
-:class:`core.backtest.DataSplit` and **never accessed** — this module holds no
-OOS confirmation token and calls no OOS accessor. The OOS evaluation is a
-later, sealed stage.
+OOS discipline. ``run_candidate`` / ``run_proposal`` are IN-SAMPLE only and
+never open the holdout. The held-out OOS slice is opened ONLY by
+``run_candidate_oos`` / ``run_robustness`` (the critic stage), which supply the
+literal confirmation token to :meth:`core.backtest.DataSplit.access_out_of_sample`.
+That token (``_OOS_CONFIRMATION``) lives only in this deterministic module —
+the LLM never sees or holds it; it only ever receives the resulting evidence.
 
 Determinism: identical inputs ⇒ identical ``config_hash`` ⇒ identical evidence
 (the engine is deterministic; this module adds no randomness).
@@ -23,19 +24,29 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from core.backtest import BacktestEngine, CostModel, DataSplit
+from core.backtest import BacktestEngine, BacktestResult, CostModel, DataSplit
 from core.backtest.metrics import BacktestMetrics
 from core.market_data import CandleProvider, MarketDataError
 from core.models import (
     BacktestEvidence,
     BacktestMetricsView,
     Candle,
+    CostStressPoint,
+    EvidenceSegment,
     GateResult,
+    ParamNeighborResult,
     RiskConfig,
+    RobustnessEvidence,
     StrategyCandidate,
     StrategyProposal,
+    TradeConcentration,
 )
 from core.strategy import build_strategy
+
+# The literal confirmation token DataSplit requires to open the held-out OOS
+# slice. It lives HERE, in deterministic harness code, and is supplied ONLY by
+# run_candidate_oos / run_robustness below. The LLM never sees or holds it.
+_OOS_CONFIRMATION = "I_AM_DONE_TUNING"
 
 # A roomy default risk config — enough that ordinary candidates can actually
 # trade in-sample (the engine still routes every order through the real
@@ -57,11 +68,13 @@ class BacktestRunConfig:
     """Inputs for the deterministic harness (everything the engine needs)."""
 
     lookback_count: int = 1000  # bars to fetch per candidate
-    oos_fraction: float = 0.2  # held-out tail — sealed, never run here
+    oos_fraction: float = 0.2  # held-out tail — sealed, opened ONLY by the critic
     starting_balance: Decimal = Decimal("100000")
     cost_model: CostModel = field(default_factory=CostModel)
     risk_config: RiskConfig = DEFAULT_RISK_CONFIG
     day_rollover_utc_hour: int = 21
+    # Cost multipliers for the cost-sensitivity stress (critic stage).
+    cost_multipliers: tuple[Decimal, ...] = (Decimal("1.5"), Decimal("2.0"))
 
     # --- Fixed deterministic gate thresholds (NOT the final word — the critic
     #     + OOS + a human decide deployment; these are cheap triage gates) ---
@@ -146,16 +159,9 @@ class HarnessError(Exception):
     ACTUALLY run produce evidence (the agent must not reference others)."""
 
 
-def run_candidate(
-    candidate: StrategyCandidate,
-    *,
-    candle_provider: CandleProvider,
-    config: BacktestRunConfig,
-) -> BacktestEvidence:
-    """Run ONE candidate's in-sample backtest → :class:`BacktestEvidence`.
-
-    Raises :class:`HarnessError` if the candidate cannot be run.
-    """
+def _fetch(
+    candidate: StrategyCandidate, *, candle_provider: CandleProvider, config: BacktestRunConfig
+) -> list[Candle]:
     try:
         candles = candle_provider.get_candles(
             candidate.instrument,
@@ -164,36 +170,49 @@ def run_candidate(
         )
     except (MarketDataError, KeyError, ValueError) as e:
         raise HarnessError(f"no candles for {candidate.instrument}: {e}") from e
-
     if len(candles) < 4:
         raise HarnessError(f"too few candles for {candidate.instrument} ({len(candles)})")
+    return candles
 
-    in_sample = _in_sample_only(candles, config.oos_fraction)
-    if len(in_sample) < 2:
-        raise HarnessError("in-sample window too short to backtest")
 
+def _run_engine(
+    bars: Sequence[Candle],
+    candidate: StrategyCandidate,
+    *,
+    config: BacktestRunConfig,
+    cost_model: CostModel,
+) -> BacktestResult:
+    """Build the strategy and run the engine over ``bars``. Pure / deterministic."""
     try:
         strategy = build_strategy(candidate)
     except Exception as e:  # not constructible → treated as not-run
         raise HarnessError(f"candidate not constructible: {e}") from e
-
-    engine = BacktestEngine(
-        bars=list(in_sample),
+    return BacktestEngine(
+        bars=list(bars),
         strategy=strategy,
         risk_config=config.risk_config,
-        cost_model=config.cost_model,
+        cost_model=cost_model,
         starting_balance=config.starting_balance,
         day_rollover_utc_hour=config.day_rollover_utc_hour,
-    )
-    result = engine.run()
+    ).run()
 
+
+def _evidence_from_result(
+    candidate_id: str,
+    bars: Sequence[Candle],
+    result: BacktestResult,
+    *,
+    segment: EvidenceSegment,
+    config: BacktestRunConfig,
+) -> BacktestEvidence:
     gates = _compute_gates(result.metrics, halted=result.halted_due_to_kill_switch, config=config)
     return BacktestEvidence(
-        candidate_id=candidate.candidate_id,
+        candidate_id=candidate_id,
         config_hash=result.config_hash,
         pair=result.pair,
-        in_sample_start=in_sample[0].time,
-        in_sample_end=in_sample[-1].time,
+        segment=segment,
+        window_start=bars[0].time,
+        window_end=bars[-1].time,
         bars_total=result.bars_total,
         bars_processed=result.bars_processed,
         halted_due_to_kill_switch=result.halted_due_to_kill_switch,
@@ -210,14 +229,35 @@ def run_candidate(
     )
 
 
+def run_candidate(
+    candidate: StrategyCandidate,
+    *,
+    candle_provider: CandleProvider,
+    config: BacktestRunConfig,
+) -> BacktestEvidence:
+    """Run ONE candidate's IN-SAMPLE backtest → :class:`BacktestEvidence`.
+
+    The OOS tail is split off and sealed — this never opens it. Raises
+    :class:`HarnessError` if the candidate cannot be run.
+    """
+    candles = _fetch(candidate, candle_provider=candle_provider, config=config)
+    in_sample = DataSplit(candles, oos_fraction=config.oos_fraction).in_sample
+    if len(in_sample) < 2:
+        raise HarnessError("in-sample window too short to backtest")
+    result = _run_engine(in_sample, candidate, config=config, cost_model=config.cost_model)
+    return _evidence_from_result(
+        candidate.candidate_id, in_sample, result, segment=EvidenceSegment.IN_SAMPLE, config=config
+    )
+
+
 def run_proposal(
     proposal: StrategyProposal,
     *,
     candle_provider: CandleProvider,
     config: BacktestRunConfig,
 ) -> tuple[tuple[BacktestEvidence, ...], tuple[tuple[str, str], ...]]:
-    """Run every candidate. Returns ``(evidence, skipped)`` where ``skipped``
-    is ``(candidate_id, reason)`` for candidates that could not be run."""
+    """Run every candidate IN-SAMPLE. Returns ``(evidence, skipped)`` where
+    ``skipped`` is ``(candidate_id, reason)`` for candidates that could not run."""
     evidence: list[BacktestEvidence] = []
     skipped: list[tuple[str, str]] = []
     for candidate in proposal.candidates:
@@ -230,11 +270,179 @@ def run_proposal(
     return tuple(evidence), tuple(skipped)
 
 
-def _in_sample_only(candles: Sequence[Candle], oos_fraction: float) -> tuple[Candle, ...]:
-    """Return ONLY the in-sample slice. The OOS tail is split off and sealed —
-    this function never returns it and never takes the OOS token."""
-    split = DataSplit(candles, oos_fraction=oos_fraction)
-    return split.in_sample
+# ---------------------------------------------------------------------------
+# Robustness evidence (critic stage) — OOS, cost, parameter, concentration.
+# All deterministic. The OOS path is the ONLY place the holdout token is used.
+# ---------------------------------------------------------------------------
+
+
+def _scale_cost(model: CostModel, multiplier: Decimal) -> CostModel:
+    """Scale the friction components (spread / commission / slippage) for the
+    cost-sensitivity stress; swap params are left as-is."""
+    return CostModel(
+        half_spread=model.half_spread * multiplier,
+        commission_per_unit=model.commission_per_unit * multiplier,
+        slippage_per_unit=model.slippage_per_unit * multiplier,
+        swap_long_per_unit_per_day=model.swap_long_per_unit_per_day,
+        swap_short_per_unit_per_day=model.swap_short_per_unit_per_day,
+        weekend_swap_multiplier=model.weekend_swap_multiplier,
+    )
+
+
+def _neighbor(candidate: StrategyCandidate, param_name: str, value: Decimal) -> StrategyCandidate:
+    new_params = tuple(
+        p.model_copy(update={"value": value}) if p.name == param_name else p
+        for p in candidate.parameters
+    )
+    return candidate.model_copy(update={"parameters": new_params})
+
+
+def _trade_concentration(result: BacktestResult) -> TradeConcentration:
+    """How much in-sample profit comes from the few biggest winners."""
+    closed = [t for t in result.trade_log if t.realized_pnl is not None]
+    wins = sorted(
+        (t.realized_pnl for t in closed if t.realized_pnl is not None and t.realized_pnl > 0),
+        reverse=True,
+    )
+    gross = sum(wins, Decimal("0"))
+    if gross > 0:
+        top1 = float(wins[0] / gross)
+        top5 = float(sum(wins[:5], Decimal("0")) / gross)
+    else:
+        top1 = 0.0
+        top5 = 0.0
+    return TradeConcentration(
+        closed_trade_count=len(closed),
+        gross_profit=gross,
+        top_trade_profit_share=top1,
+        top5_profit_share=top5,
+    )
+
+
+def run_candidate_oos(
+    candidate: StrategyCandidate,
+    *,
+    candle_provider: CandleProvider,
+    config: BacktestRunConfig,
+) -> BacktestEvidence:
+    """Run a candidate on the sealed OUT-OF-SAMPLE slice.
+
+    This is the ONLY function that opens the holdout: it supplies the literal
+    confirmation token to :meth:`DataSplit.access_out_of_sample`. The token
+    never leaves deterministic code; the LLM only ever sees the resulting
+    evidence. Raises :class:`HarnessError` if OOS cannot be run.
+    """
+    candles = _fetch(candidate, candle_provider=candle_provider, config=config)
+    split = DataSplit(candles, oos_fraction=config.oos_fraction)
+    oos = split.access_out_of_sample(token=_OOS_CONFIRMATION)
+    if len(oos) < 2:
+        raise HarnessError("out-of-sample window too short to backtest")
+    result = _run_engine(oos, candidate, config=config, cost_model=config.cost_model)
+    return _evidence_from_result(
+        candidate.candidate_id, oos, result, segment=EvidenceSegment.OUT_OF_SAMPLE, config=config
+    )
+
+
+def run_robustness(
+    candidate: StrategyCandidate,
+    *,
+    candle_provider: CandleProvider,
+    config: BacktestRunConfig,
+) -> RobustnessEvidence:
+    """Compute ALL deterministic robustness evidence for one candidate: the
+    in-sample run, the token-gated OOS run, cost-sensitivity, parameter
+    sensitivity, and trade-concentration. The critic interprets this; it never
+    recomputes any of it. Raises :class:`HarnessError` if the candidate cannot
+    be run at all."""
+    candles = _fetch(candidate, candle_provider=candle_provider, config=config)
+    split = DataSplit(candles, oos_fraction=config.oos_fraction)
+    in_sample = split.in_sample
+    if len(in_sample) < 2:
+        raise HarnessError("in-sample window too short to backtest")
+
+    base_result = _run_engine(in_sample, candidate, config=config, cost_model=config.cost_model)
+    in_evidence = _evidence_from_result(
+        candidate.candidate_id,
+        in_sample,
+        base_result,
+        segment=EvidenceSegment.IN_SAMPLE,
+        config=config,
+    )
+
+    # OOS — token-gated, deterministic, the only place the holdout opens.
+    oos_evidence: BacktestEvidence | None = None
+    oos = split.access_out_of_sample(token=_OOS_CONFIRMATION)
+    if len(oos) >= 2:
+        oos_result = _run_engine(oos, candidate, config=config, cost_model=config.cost_model)
+        oos_evidence = _evidence_from_result(
+            candidate.candidate_id,
+            oos,
+            oos_result,
+            segment=EvidenceSegment.OUT_OF_SAMPLE,
+            config=config,
+        )
+
+    # Cost sensitivity — re-run in-sample with scaled friction.
+    cost_stress: list[CostStressPoint] = []
+    for mult in config.cost_multipliers:
+        stressed = _run_engine(
+            in_sample, candidate, config=config, cost_model=_scale_cost(config.cost_model, mult)
+        )
+        cost_stress.append(
+            CostStressPoint(
+                cost_multiplier=mult,
+                total_return_pct=stressed.metrics.total_return_pct,
+                sharpe_ratio=stressed.metrics.sharpe_ratio,
+                profit_factor=_finite_or_none(stressed.metrics.profit_factor),
+                trade_count=stressed.metrics.trade_count,
+            )
+        )
+
+    # Parameter sensitivity — perturb each param to its range endpoints.
+    ranges = candidate.ranges_as_dict()
+    neighbours: list[ParamNeighborResult] = []
+    for name, rng in ranges.items():
+        for value in (rng.low, rng.high):
+            neighbours.append(
+                _param_neighbor_result(candidate, name, value, in_sample=in_sample, config=config)
+            )
+
+    return RobustnessEvidence(
+        candidate_id=candidate.candidate_id,
+        in_sample=in_evidence,
+        out_of_sample=oos_evidence,
+        cost_stress=tuple(cost_stress),
+        param_sensitivity=tuple(neighbours),
+        trade_concentration=_trade_concentration(base_result),
+    )
+
+
+def _param_neighbor_result(
+    candidate: StrategyCandidate,
+    name: str,
+    value: Decimal,
+    *,
+    in_sample: Sequence[Candle],
+    config: BacktestRunConfig,
+) -> ParamNeighborResult:
+    neighbour = _neighbor(candidate, name, value)
+    try:
+        result = _run_engine(in_sample, neighbour, config=config, cost_model=config.cost_model)
+    except HarnessError:
+        return ParamNeighborResult(
+            param_name=name,
+            value=value,
+            constructible=False,
+            total_return_pct=None,
+            sharpe_ratio=None,
+        )
+    return ParamNeighborResult(
+        param_name=name,
+        value=value,
+        constructible=True,
+        total_return_pct=result.metrics.total_return_pct,
+        sharpe_ratio=result.metrics.sharpe_ratio,
+    )
 
 
 __all__ = [
@@ -243,5 +451,7 @@ __all__ = [
     "HarnessError",
     "metrics_view",
     "run_candidate",
+    "run_candidate_oos",
     "run_proposal",
+    "run_robustness",
 ]

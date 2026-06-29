@@ -409,12 +409,13 @@ def test_tier1_catches_reference_to_non_run_candidate() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_no_oos_token_anywhere_in_agent_or_harness() -> None:
-    core = Path(__file__).resolve().parents[1] / "core" / "agents"
-    for name in ("backtest_agent.py", "backtest_harness.py"):
-        src = (core / name).read_text()
-        assert "I_AM_DONE_TUNING" not in src, f"{name} references the OOS token"
-        assert "access_out_of_sample" not in src, f"{name} accesses the OOS slice"
+def test_backtest_agent_never_touches_oos_token() -> None:
+    # backtest_agent is IN-SAMPLE only — it must never reference the OOS token
+    # or accessor. (The harness DOES open the OOS slice, but only for the critic
+    # stage, in deterministic code — see test_critic_agent.)
+    src = (Path(__file__).resolve().parents[1] / "core" / "agents" / "backtest_agent.py").read_text()
+    assert "I_AM_DONE_TUNING" not in src
+    assert "access_out_of_sample" not in src
 
 
 # ---------------------------------------------------------------------------

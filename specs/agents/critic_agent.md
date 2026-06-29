@@ -2,7 +2,14 @@
 
 ## Purpose
 
-**Adversarial.** Try to **kill** every `StrategyCandidate` and every `ParameterProposal` using the overfitting checklist before it ever reaches a human. Default verdict is `reject` — the proposal must clear every check to flip to `accept`.
+**Adversarial.** Try to **kill** every candidate that survived `backtest_agent`, using the overfitting checklist, before it reaches a human. Default verdict is **kill** — a candidate is presumed overfit/spurious until the deterministic evidence forces otherwise.
+
+> **Build status (Stage 3).** Implemented and reconciled to the real engine/evidence:
+> - **Verdict is `{kill, survive_for_now}` — there is deliberately NO `approve`/`accept`/`deploy`/`trade` value (not even representable).** The critic NEVER authorizes anything; `survive_for_now` means only "not yet killed", explicitly NOT "validated". Only a human, downstream, can authorize live trading. (This supersedes the spec's earlier `accept | reject | needs_more_evidence`.)
+> - **This is the stage that opens the OUT-OF-SAMPLE holdout** — but only in deterministic code. The harness (`core/agents/backtest_harness.py: run_robustness` / `run_candidate_oos`) supplies the token to `DataSplit.access_out_of_sample`; the LLM never sees or holds the token, only the resulting OOS evidence. OOS collapse vs in-sample is the canonical overfit kill.
+> - Deterministic robustness evidence the critic interprets (never recomputes): in-sample + OOS runs, **cost-sensitivity** (1.5x/2x), **parameter-sensitivity** (neighbours within `parameter_ranges`), and **trade-concentration**. Same metrics-verbatim integrity gate as `backtest_agent`, now covering the OOS metrics too.
+> - **Walk-forward instability** and **regime-dependence** checklist items are **deferred** until the harness computes them; the critic attacks the items it has deterministic evidence for.
+> - Tier: **HEAVY** (the strongest reasoner) — the highest-stakes single judgement in the slow loop.
 
 ## Responsibilities
 
@@ -18,35 +25,44 @@
 - For each test, emit a structured result with the **specific evidence** in the backtest report.
 - Render a final `CriticVerdict` of `accept` (all gates pass), `reject` (one or more fail), or `needs_more_evidence` (a gate cannot be evaluated from the provided report).
 
-## Inputs (with types)
+## Inputs (with types) — as built
 
 ```python
-class CriticRequest:
+@dataclass(frozen=True)
+class CriticRequest:               # core.agents.critic_agent
     run_id: str
-    subject: StrategyCandidate | ParameterProposal
-    backtest_interpretation: BacktestInterpretation
-    market_context: MarketContextReport
-    minimum_trade_count: int                 # gate per skills/overfitting-checklist
-    regime_dependence_threshold: float       # max share of P&L from a single regime
-    cost_multipliers: list[float]            # e.g. [1.5, 2.0]
+    robustness: tuple[RobustnessEvidence, ...]   # ALL deterministic evidence (incl. OOS)
+    backtest_verdicts: BacktestVerdictSet | None = None  # prior triage, context only
+    tier: ModelTier = ModelTier.HEAVY
 ```
 
-## Outputs (strict structured schema)
+`RobustnessEvidence` (per candidate, from the harness) carries the in-sample
+`BacktestEvidence`, the token-gated out-of-sample `BacktestEvidence`, the
+cost-stress points, the parameter-neighbour results, and the trade-concentration
+stat. The critic reasons over these RAW numbers, not the prior agent's prose.
+
+## Outputs (strict structured schema) — as built
 
 ```python
-class CriticVerdict:
-    verdict_id: str
+class CriticVerdictSet(BaseModel):     # core.models, frozen, extra=forbid
     run_id: str
-    subject_id: str                          # candidate_id or proposal_id
     schema_version: str = "1.0"
-    checks: list[CriticCheckResult]          # one per checklist item
-    verdict: Literal["accept", "reject", "needs_more_evidence"]
-    kill_reasons: list[str]                  # required if verdict != "accept"
-    confidence: float                        # 0..1
-    notes: str                               # ≤ 600 chars, neutral
+    verdicts: tuple[CriticVerdict, ...]
+
+class CriticVerdict(BaseModel):        # core.models, frozen, extra=forbid
+    candidate_id: str
+    in_sample_config_hash: str
+    oos_config_hash: str | None
+    in_sample_metrics: BacktestMetricsView         # copied VERBATIM
+    out_of_sample_metrics: BacktestMetricsView | None  # copied verbatim if present
+    verdict: CriticVerdictKind         # kill | survive_for_now  (NEVER approve)
+    concerns: tuple[OverfittingConcern, ...]   # each mapped to a ChecklistItem
+    assessment: str                    # ≤ 1000 chars, adversarial IS-vs-OOS read
+    caveats: str                       # ≤ 500 chars
 ```
 
-Each `CriticCheckResult`: `{name, pass, evidence_citation, severity}`.
+There is **NO approve/deploy/live field** anywhere, and the free text is scrubbed
+for execution intent.
 
 ## Tools & Skills used
 
@@ -60,7 +76,7 @@ Each `CriticCheckResult`: `{name, pass, evidence_citation, severity}`.
 
 ## Model tier and why
 
-**Opus** (`claude-opus-4-8`). This is the highest-stakes single decision in the slow loop — a wrong `accept` lets a curve-fit go in front of a human under a false halo of validation. Opus's adversarial reasoning is the budget we explicitly pay for. Cache the (long, stable) checklist prompt aggressively; per-call inputs are small.
+**HEAVY tier** (`ModelTier.HEAVY` → the strongest reasoner). This is the highest-stakes single judgement in the slow loop — a false `survive_for_now` lets a curve-fit reach a human under a halo it didn't earn. The heavy tier's adversarial reasoning is the budget we explicitly pay for. The (long, stable) checklist prompt is cached aggressively; per-call inputs are small.
 
 ## System-prompt structure
 

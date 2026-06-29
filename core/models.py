@@ -1076,14 +1076,25 @@ class GateResult(BaseModel):
     detail: str = ""
 
 
-class BacktestEvidence(BaseModel):
-    """Deterministic, harness-computed evidence for ONE candidate's in-sample
-    backtest. The LLM never produces this — it only interprets it.
+class EvidenceSegment(StrEnum):
+    """Which data window a :class:`BacktestEvidence` covers.
 
-    **In-sample only.** There are NO out-of-sample fields here; the OOS holdout
-    stays sealed at this stage. Every number traces to a frozen
-    :class:`core.backtest.types.BacktestResult` with the ``config_hash`` for
-    audit + determinism.
+    ``out_of_sample`` is produced ONLY by the deterministic harness's
+    token-gated path (the critic stage); the LLM never opens that slice.
+    """
+
+    IN_SAMPLE = "in_sample"
+    OUT_OF_SAMPLE = "out_of_sample"
+
+
+class BacktestEvidence(BaseModel):
+    """Deterministic, harness-computed evidence for ONE candidate's backtest
+    over a single window. The LLM never produces this — it only interprets it.
+
+    ``segment`` says whether this is the in-sample run (backtest_agent) or the
+    sealed out-of-sample run (critic stage, token-gated). Every number traces
+    to a frozen :class:`core.backtest.types.BacktestResult` with the
+    ``config_hash`` for audit + determinism.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -1091,8 +1102,9 @@ class BacktestEvidence(BaseModel):
     candidate_id: str
     config_hash: str
     pair: str
-    in_sample_start: datetime
-    in_sample_end: datetime
+    segment: EvidenceSegment = EvidenceSegment.IN_SAMPLE
+    window_start: datetime
+    window_end: datetime
     bars_total: int
     bars_processed: int
     halted_due_to_kill_switch: bool
@@ -1107,7 +1119,7 @@ class BacktestEvidence(BaseModel):
     gates: tuple[GateResult, ...]
     gates_all_passed: bool
 
-    @field_validator("in_sample_start", "in_sample_end")
+    @field_validator("window_start", "window_end")
     @classmethod
     def _utc_only(cls, v: datetime) -> datetime:
         return _require_utc(v)
@@ -1166,3 +1178,147 @@ class BacktestVerdictSet(BaseModel):
     run_id: str
     schema_version: str = "1.0"
     verdicts: tuple[BacktestVerdict, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# Robustness evidence + critic verdict (critic_agent)
+# ---------------------------------------------------------------------------
+
+
+class CostStressPoint(BaseModel):
+    """In-sample metrics re-run at a scaled cost model (cost-sensitivity)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cost_multiplier: Decimal
+    total_return_pct: Decimal
+    sharpe_ratio: float
+    profit_factor: float | None
+    trade_count: int
+
+
+class ParamNeighborResult(BaseModel):
+    """One parameter perturbed to a neighbour value within its declared range,
+    re-run in-sample. Big metric swings across neighbours = fragile = overfit."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    param_name: str
+    value: Decimal
+    constructible: bool
+    total_return_pct: Decimal | None  # None when the neighbour could not run
+    sharpe_ratio: float | None
+
+
+class TradeConcentration(BaseModel):
+    """How concentrated in-sample profit is in a few trades (deterministic)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    closed_trade_count: int
+    gross_profit: Decimal
+    top_trade_profit_share: float  # largest winning trade / gross profit, in [0,1]
+    top5_profit_share: float  # top-5 winning trades / gross profit, in [0,1]
+
+
+class RobustnessEvidence(BaseModel):
+    """All deterministic robustness evidence for ONE candidate — the critic's
+    input. Computed by the harness; the LLM interprets, never recomputes.
+
+    ``out_of_sample`` is produced by the token-gated OOS path (the only place
+    the holdout opens) and is ``None`` if the critic did not stress this
+    candidate.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    candidate_id: str
+    in_sample: BacktestEvidence
+    out_of_sample: BacktestEvidence | None = None
+    cost_stress: tuple[CostStressPoint, ...] = ()
+    param_sensitivity: tuple[ParamNeighborResult, ...] = ()
+    trade_concentration: TradeConcentration | None = None
+
+
+class ChecklistItem(StrEnum):
+    """The overfitting-checklist items a concern can map to (see
+    ``skills/overfitting-checklist``). Walk-forward / regime-dependence are
+    deferred until the harness computes them."""
+
+    OUT_OF_SAMPLE_DECAY = "out_of_sample_decay"
+    COST_SENSITIVITY = "cost_sensitivity"
+    PARAMETER_SENSITIVITY = "parameter_sensitivity"
+    TRADE_COUNT = "trade_count"
+    TRADE_CONCENTRATION = "trade_concentration"
+    DRAWDOWN_SHAPE = "drawdown_shape"
+    LOOKAHEAD_DATA_SNOOPING = "lookahead_data_snooping"
+
+
+class CriticVerdictKind(StrEnum):
+    """The ONLY two outcomes the critic can return.
+
+    There is deliberately NO ``approve`` / ``accept`` / ``deploy`` / ``trade``
+    value — the critic NEVER authorizes anything. ``survive_for_now`` means only
+    "not yet killed", explicitly NOT "validated" and NOT "deploy". Only a human,
+    downstream, can authorize live trading.
+    """
+
+    KILL = "kill"
+    SURVIVE_FOR_NOW = "survive_for_now"
+
+
+class OverfittingConcern(BaseModel):
+    """One specific overfitting finding, mapped to a checklist item."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    item: ChecklistItem
+    finding: str
+
+
+class CriticVerdict(BaseModel):
+    """The critic's adversarial verdict on ONE candidate.
+
+    Kill-by-default. ``in_sample_metrics`` and ``out_of_sample_metrics`` are
+    copied VERBATIM from the deterministic evidence (Tier-1 rejects any
+    mismatch, and rejects an OOS claim the harness did not produce). The agent
+    authors only the prose + the verdict + the mapped concerns. There is NO
+    approve/deploy/live field, and the free text is scrubbed for execution
+    intent.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    candidate_id: str
+    in_sample_config_hash: str
+    oos_config_hash: str | None = None
+    in_sample_metrics: BacktestMetricsView  # verbatim
+    out_of_sample_metrics: BacktestMetricsView | None = None  # verbatim if present
+    verdict: CriticVerdictKind
+    concerns: tuple[OverfittingConcern, ...] = ()
+    assessment: str  # in-sample-vs-OOS + robustness read; ≤ 1000 chars
+    caveats: str = ""  # ≤ 500 chars
+
+    @field_validator("assessment")
+    @classmethod
+    def _assessment_sane(cls, v: str) -> str:
+        if len(v) > 1000:
+            raise ValueError("assessment must be ≤ 1000 chars")
+        return _scrub_execution_intent("assessment", v)
+
+    @field_validator("caveats")
+    @classmethod
+    def _caveats_sane(cls, v: str) -> str:
+        if len(v) > 500:
+            raise ValueError("caveats must be ≤ 500 chars")
+        return _scrub_execution_intent("caveats", v)
+
+
+class CriticVerdictSet(BaseModel):
+    """The critic_agent's structured output: one verdict per candidate."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: str
+    schema_version: str = "1.0"
+    verdicts: tuple[CriticVerdict, ...] = ()

@@ -69,7 +69,7 @@ def _summarise(verdicts: BacktestVerdictSet, evidence: tuple[BacktestEvidence, .
         ev = by_id.get(v.candidate_id)
         if ev is not None:
             lines.append(
-                f"     window:  {ev.in_sample_start.date()} .. {ev.in_sample_end.date()} "
+                f"     window:  {ev.window_start.date()} .. {ev.window_end.date()} "
                 f"({ev.bars_total} bars in-sample)"
             )
         lines.append(f"     read:    {v.assessment}")
