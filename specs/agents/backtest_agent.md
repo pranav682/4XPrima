@@ -2,7 +2,12 @@
 
 ## Purpose
 
-Configure backtests, drive the deterministic backtester (which lives in `backtest/`), and **interpret** the results. The agent does no heavy compute — it sets up runs, reads the structured output, and writes a verdict.
+Turn a `StrategyProposal` into honest, judged backtest results: build each strategy, run the deterministic Stage-2 engine, and **interpret** the output into a verdict. The agent does no heavy compute and **never produces or alters a number** — it interprets metrics the deterministic code computed.
+
+> **Build status (Stage 3).** Implemented in the **in-sample-only, harness-based** form below, reconciled to the real Stage-2 engine (`core/backtest/`):
+> - The deterministic **harness** (`core/agents/backtest_harness.py`) — NOT the LLM and NOT a runtime tool — does all compute: `build_strategy(candidate)` → the engine over the **in-sample** window → a frozen `BacktestEvidence` per candidate (verbatim metrics, cost breakdown, `config_hash`, fixed-gate flags). The agent consumes the evidence already computed; it calls no tools at runtime (keeps the cache hot).
+> - **In-sample only.** The OOS holdout stays sealed — no path in this agent or harness supplies the OOS token. The richer gate set sketched later in this doc (**out-of-sample, walk-forward, cost-sensitivity, regime-breakdown**) is a **future extension**, deferred until the harness orchestrates those runs. The engine's metric pack also has no t-stat / average-R yet; the verdict reports the metrics the engine actually computes.
+> - Profitability is decided later by the OOS slice + the critic, never here. This agent triages.
 
 ## Responsibilities
 
@@ -11,47 +16,65 @@ Configure backtests, drive the deterministic backtester (which lives in `backtes
 - Read the `BacktestRunReport` (deterministic JSON from `backtest/`).
 - Produce a `BacktestInterpretation` with explicit go / no-go on each gate (in-sample, out-of-sample, walk-forward, cost sensitivity).
 
-## Inputs (with types)
+## Inputs (with types) — as built
 
 ```python
-class BacktestRequest:
+@dataclass(frozen=True)
+class BacktestAgentRequest:        # core.agents.backtest_agent
     run_id: str
-    target: StrategyCandidate | ParameterProposal
-    data_window: DataWindow                  # full date range available
-    walk_forward: WalkForwardConfig          # window / step / n_folds
-    oos_holdout: OOSConfig                   # held-out tail, never touched in fitting
-    cost_model: CostModelConfig              # spread, slippage, commission, swap
-    seeds: list[int]                         # for any stochastic component
+    proposal: StrategyProposal     # from strategy_lab
+    evidence: tuple[BacktestEvidence, ...]   # ALREADY computed by the harness
+    tier: ModelTier = ModelTier.DEFAULT
 ```
 
-## Outputs (strict structured schema)
+The deterministic harness is configured separately:
 
 ```python
-class BacktestInterpretation:
+@dataclass(frozen=True)
+class BacktestRunConfig:           # core.agents.backtest_harness
+    lookback_count: int = 1000     # bars per candidate
+    oos_fraction: float = 0.2      # held-out tail — sealed, never run here
+    starting_balance: Decimal
+    cost_model: CostModel
+    risk_config: RiskConfig        # every order routes through the real RiskManager
+    # fixed deterministic gate thresholds:
+    min_trade_count: int = 30
+    max_drawdown_ceiling: Decimal = Decimal("0.30")
+    min_profit_factor: Decimal = Decimal("1.0")
+```
+
+## Outputs (strict structured schema) — as built
+
+```python
+class BacktestVerdictSet(BaseModel):    # core.models, frozen, extra=forbid
     run_id: str
-    target_id: str                           # candidate_id or proposal_id
     schema_version: str = "1.0"
-    in_sample: GateResult                    # metrics + pass/fail vs thresholds
-    out_of_sample: GateResult
-    walk_forward: WalkForwardResult          # per-fold + aggregate
-    cost_sensitivity: CostSensitivityResult  # P&L under 1.5x and 2x cost
-    regime_breakdown: dict[RegimeLabel, GateResult]
-    overall: Literal["pass", "fail", "marginal"]
-    fail_reasons: list[str]                  # empty if pass
-    interpretation: str                      # ≤ 800 chars, neutral, no recommendations
-    raw_report_path: str                     # pointer to deterministic JSON for audit
+    verdicts: tuple[BacktestVerdict, ...]
+
+class BacktestVerdict(BaseModel):       # core.models, frozen, extra=forbid
+    candidate_id: str
+    config_hash: str                    # must match the run's evidence
+    metrics: BacktestMetricsView        # copied VERBATIM from the evidence
+    gates: tuple[GateResult, ...]       # copied verbatim
+    assessment: str                     # ≤ 800 chars, honest in-sample read
+    concerns: tuple[str, ...]           # overfit smells, fragility
+    triage: BacktestTriage              # advance_to_critic | reject | needs_different_params
+    caveats: str                        # ≤ 500 chars, in-sample-only / not-predictive
 ```
 
-`GateResult` includes: total return, Sharpe, Sortino, max drawdown, hit rate, profit factor, average R, trade count, exposure pct, t-stat vs zero — see `skills/backtesting-methodology`.
+`BacktestMetricsView` carries exactly the engine's metric pack (total/annualised
+return, Sharpe, Sortino, max drawdown, win rate, profit factor, trade count, avg
+trade PnL, exposure); `sortino_ratio` / `profit_factor` are `null` when the
+deterministic value is infinite (no downside / no losing trades). There is **NO
+out-of-sample metric and NO live/deploy field** anywhere.
 
 ## Tools & Skills used
 
-**Tools (eager):**
-- `backtest_run` — submits a `BacktestRunConfig`, returns a `BacktestRunReport` (deterministic).
-- `read_strategy_spec` — fetches a `StrategyCandidate` by id (idempotent).
-
-**Tools (deferred):**
-- `backtest_export_plots` — only when reporting agent later asks for visuals.
+**Tools: none at runtime** (as built). The backtest is run by the deterministic
+harness BEFORE the agent call; the agent receives the evidence as data. This
+keeps the cache hot and removes any path for the LLM to re-run or alter a
+backtest. (The spec originally imagined `backtest_run` / `read_strategy_spec`
+tools; the harness supersedes them.)
 
 **Skills:**
 - `backtesting-methodology` — gate thresholds and walk-forward rules.
@@ -61,7 +84,7 @@ class BacktestInterpretation:
 
 ## Model tier and why
 
-**Sonnet** (`claude-sonnet-4-6`). Interpreting a structured report against fixed gates is high-stakes but well-bounded — the heavy reasoning is done by the deterministic backtester. Opus is reserved for the critic.
+**DEFAULT tier** (`ModelTier.DEFAULT` → `gpt-5.4`). Interpreting a structured report against fixed gates is high-stakes but well-bounded — the heavy reasoning is done by the deterministic harness. The HEAVY tier is reserved for the critic.
 
 ## System-prompt structure
 

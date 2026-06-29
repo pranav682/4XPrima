@@ -994,3 +994,175 @@ class StrategyProposal(BaseModel):
     @classmethod
     def _utc_only(cls, v: datetime) -> datetime:
         return _require_utc(v)
+
+
+# ---------------------------------------------------------------------------
+# Backtest evidence + verdict (backtest_agent)
+# ---------------------------------------------------------------------------
+
+
+def _float_close(a: float, b: float, *, rel: float = 1e-6) -> bool:
+    """True if two floats are equal within a small relative tolerance.
+
+    Used to compare the agent's copied metric against the deterministic one:
+    a verbatim copy is essentially exact, so the tolerance only absorbs
+    JSON re-typing — it is far tighter than any fabricated number would be.
+    """
+    return abs(a - b) <= rel * (1.0 + abs(b))
+
+
+class BacktestMetricsView(BaseModel):
+    """A frozen, JSON-serialisable copy of the deterministic backtest metrics.
+
+    This is the contract for the **integrity boundary**: the LLM must copy
+    these numbers VERBATIM from the harness-computed evidence, never generate
+    or alter them. ``sortino_ratio`` / ``profit_factor`` are ``None`` when the
+    deterministic value is infinite (no downside / no losing trades) — we use
+    ``None`` rather than a fake large number so nothing is misrepresented and
+    the value round-trips cleanly through JSON.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    total_return_pct: Decimal
+    annualised_return_pct: Decimal
+    sharpe_ratio: float
+    sortino_ratio: float | None  # None = no downside (undefined / infinite)
+    max_drawdown_pct: Decimal
+    win_rate: float
+    profit_factor: float | None  # None = no losing trades (undefined / infinite)
+    trade_count: int
+    avg_trade_pnl: Decimal
+    exposure_pct: float
+
+    def differing_fields(self, other: BacktestMetricsView) -> tuple[str, ...]:
+        """Names of fields that differ from ``other`` (empty == identical).
+
+        Decimal + int fields compare exactly; float fields within a tight
+        relative tolerance; ``None`` must match ``None``. This is the engine
+        of the Tier-1 "metrics copied verbatim" check.
+        """
+        diffs: list[str] = []
+        for name in (
+            "total_return_pct",
+            "annualised_return_pct",
+            "max_drawdown_pct",
+            "avg_trade_pnl",
+        ):
+            if getattr(self, name) != getattr(other, name):
+                diffs.append(name)
+        if self.trade_count != other.trade_count:
+            diffs.append("trade_count")
+        for name in ("sharpe_ratio", "win_rate", "exposure_pct"):
+            if not _float_close(getattr(self, name), getattr(other, name)):
+                diffs.append(name)
+        for name in ("sortino_ratio", "profit_factor"):
+            a = getattr(self, name)
+            b = getattr(other, name)
+            if (a is None) != (b is None):
+                diffs.append(name)
+            elif a is not None and b is not None and not _float_close(a, b):
+                diffs.append(name)
+        return tuple(diffs)
+
+
+class GateResult(BaseModel):
+    """One deterministic fixed-gate pass/fail (computed by the harness)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    passed: bool
+    detail: str = ""
+
+
+class BacktestEvidence(BaseModel):
+    """Deterministic, harness-computed evidence for ONE candidate's in-sample
+    backtest. The LLM never produces this — it only interprets it.
+
+    **In-sample only.** There are NO out-of-sample fields here; the OOS holdout
+    stays sealed at this stage. Every number traces to a frozen
+    :class:`core.backtest.types.BacktestResult` with the ``config_hash`` for
+    audit + determinism.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    candidate_id: str
+    config_hash: str
+    pair: str
+    in_sample_start: datetime
+    in_sample_end: datetime
+    bars_total: int
+    bars_processed: int
+    halted_due_to_kill_switch: bool
+    halt_reason: str | None
+    n_signals_proposed: int
+    n_signals_accepted: int
+    n_signals_rejected: int
+    starting_balance: Decimal
+    ending_equity: Decimal
+    cost_total: Decimal
+    metrics: BacktestMetricsView
+    gates: tuple[GateResult, ...]
+    gates_all_passed: bool
+
+    @field_validator("in_sample_start", "in_sample_end")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
+
+
+class BacktestTriage(StrEnum):
+    """Where a candidate goes next — a TRIAGE recommendation, not a deployment
+    decision (that's the critic + OOS + a human, never this agent)."""
+
+    ADVANCE_TO_CRITIC = "advance_to_critic"
+    REJECT = "reject"
+    NEEDS_DIFFERENT_PARAMS = "needs_different_params"
+
+
+class BacktestVerdict(BaseModel):
+    """The agent's INTERPRETATION of one candidate's in-sample evidence.
+
+    The ``metrics`` and ``gates`` are copied VERBATIM from the deterministic
+    evidence (Tier-1 rejects any mismatch). The agent authors only the prose
+    (``assessment``, ``concerns``, ``caveats``) and the ``triage``. There is NO
+    out-of-sample metric and NO execution/deployment/live-trading field; the
+    free text is scrubbed for execution intent.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    candidate_id: str
+    config_hash: str  # must match the evidence's run
+    metrics: BacktestMetricsView  # verbatim copy
+    gates: tuple[GateResult, ...]  # verbatim copy
+    assessment: str  # honest in-sample read; ≤ 800 chars
+    concerns: tuple[str, ...] = ()  # overfit smells, fragility, etc.
+    triage: BacktestTriage
+    caveats: str = ""  # in-sample-only / not-predictive caveats; ≤ 500 chars
+
+    @field_validator("assessment")
+    @classmethod
+    def _assessment_sane(cls, v: str) -> str:
+        if len(v) > 800:
+            raise ValueError("assessment must be ≤ 800 chars")
+        return _scrub_execution_intent("assessment", v)
+
+    @field_validator("caveats")
+    @classmethod
+    def _caveats_sane(cls, v: str) -> str:
+        if len(v) > 500:
+            raise ValueError("caveats must be ≤ 500 chars")
+        return _scrub_execution_intent("caveats", v)
+
+
+class BacktestVerdictSet(BaseModel):
+    """The backtest_agent's structured output: one verdict per run candidate."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: str
+    schema_version: str = "1.0"
+    verdicts: tuple[BacktestVerdict, ...] = ()
