@@ -31,6 +31,7 @@ ENFORCED=(
   core/strategy.py          # strategy contract + reference strategy
   core/backtest/            # deterministic backtester
   core/analysis/            # structural pair screener
+  core/orchestration/       # deterministic slow-loop orchestrator (no LLM)
   core/agents/strategy_lab_agent.py  # strategy proposal agent (rest of core/agents/ is debt)
   core/agents/backtest_harness.py    # deterministic backtest + OOS/robustness harness
   core/agents/backtest_agent.py      # backtest interpretation agent

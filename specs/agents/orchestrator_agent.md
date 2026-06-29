@@ -2,7 +2,13 @@
 
 ## Purpose
 
-Schedule and route the slow loop. Hold run state across an end-to-end cycle. Manage the **champion / challenger** improvement protocol: who is the current champion, what challengers are in flight, which gates each challenger has cleared.
+Sequence and route the slow loop. Hold run state across an end-to-end cycle. Manage the **champion / challenger** protocol and route survivors to a human approval queue.
+
+> **Build status (Stage 3).** Reconciled and implemented as **deterministic coordination code, NOT an LLM agent** (`core/orchestration/`):
+> - **The orchestrator makes NO LLM call.** It invokes the four worker agents (`market_context → strategy_lab → backtest_agent → critic`), which each make their own calls through `AgentRunner`, and passes typed outputs between them. Sequencing and state are a deterministic state machine, not a model — so the spec's "Sonnet for full cycles / Haiku for status ticks" LLM summarisation does **not** belong here; it belongs to **`reporting_agent`** (deferred). There is no model tier, system prompt, or structured LLM output for this component.
+> - **It is one pass:** `Orchestrator.run_cycle(universe, *, cycle_id)`. There is NO scheduler / daemon / unattended loop — running on a schedule is a deliberate later decision; a one-shot CLI is the only runner.
+> - **TWO HARD WALLS (structural).** (1) It **cannot promote or trade** — surviving the critic routes a candidate to the append-only approval QUEUE (a pending entry awaiting a human), and that is the terminus; there is no path that promotes a challenger to champion, sets a strategy live, or flips the paper/live flag (promotion is a human-only Stage-4 action, not built). (2) It **cannot touch sacred config** — it READS `RiskConfig` to pass into backtests but never mutates it, trips/resets the kill switch, or changes the paper/live flag.
+> - Same metrics-verbatim integrity as the worker agents: the orchestrator only moves their typed outputs around; it fabricates no numbers and runs the deterministic harness for in-sample + the token-gated OOS evidence.
 
 ## Responsibilities
 
@@ -13,33 +19,51 @@ Schedule and route the slow loop. Hold run state across an end-to-end cycle. Man
 - On error from any agent, decide: retry once, abort the cycle, or fall through to reporting with the failure noted.
 - **Never** mutate live config or deploy a proposal directly. Outputs an approval-request artefact for the human.
 
-## Inputs (with types)
+## Inputs / API — as built
+
+Deterministic, not an LLM request. Collaborators are injected (so the cycle is
+fully testable with mocks):
 
 ```python
-class OrchestrationTick:
-    tick_id: str                             # one per scheduled fire
-    now: datetime                            # UTC
-    cycle_kind: Literal["full", "status_check", "challenger_resume"]
-    prior_run_state: SlowLoopRunState | None # for resume
-    fast_loop_audit_excerpt: AuditExcerpt    # last 24h fills, P&L, kill-switch events
-    champion: ChampionSummary
-    challengers_in_flight: list[ChallengerState]
+class Orchestrator:                # core.orchestration.orchestrator
+    def __init__(self, *, market_context_agent, strategy_lab_agent,
+                 backtest_agent, critic_agent, runner: AgentRunner,
+                 candle_provider: CandleProvider,
+                 registry: ChampionChallengerRegistry,
+                 approval_queue: ApprovalQueue,
+                 config: OrchestratorConfig | None = None) -> None: ...
+
+    def run_cycle(self, universe: tuple[str, ...], *, cycle_id: str) -> CycleResult: ...
+
+@dataclass(frozen=True)
+class OrchestratorConfig:
+    max_cost_per_cycle_usd: Decimal      # hard per-cycle budget (cost-side kill switch)
+    per_call_cost_ceiling_usd: Decimal   # budgeted ceiling checked before each agent call
+    n_candidates: int
+    allowed_timeframes: tuple[Granularity, ...]
+    backtest_config: BacktestRunConfig   # READ-only RiskConfig is inside here
 ```
 
-## Outputs (strict structured schema)
+## Outputs — as built
 
 ```python
-class OrchestrationOutcome:
-    tick_id: str
-    schema_version: str = "1.0"
-    run_state: SlowLoopRunState              # updated state, persisted
-    actions_taken: list[AgentInvocation]     # which sub-agents were called, with token totals
-    pending_human_approvals: list[ApprovalRequest]   # zero or more
-    failures: list[AgentFailure]
-    next_tick_hint: NextTickHint             # when/why to wake again
+class CycleResult(BaseModel):        # core.orchestration.orchestrator
+    cycle_id: str
+    outcome: CycleOutcome            # completed | aborted_budget | aborted_failure
+    started_at: datetime; ended_at: datetime; duration_seconds: float
+    total_cost_usd: Decimal; stage_costs_usd: dict[str, str]
+    candidates_proposed: int; candidates_killed: int; candidates_queued: int
+    queued_identities: tuple[str, ...]
+    abort_reason: str | None
 ```
 
-`SlowLoopRunState` includes: cycle id, phase (`context | lab | backtest | optimize | critique | report | idle`), challenger registry with per-challenger gate progress, and the champion handle.
+Persistent state lives in two JSON-backed stores (same spirit as
+`usage_accounting`): `ChampionChallengerRegistry` (keyed by **strategy
+identity** — the params hash — so re-proposing the same strategy is recognised,
+not duplicated; states `PROPOSED | BACKTESTED | KILLED | SURVIVED_FOR_NOW |
+QUEUED_FOR_APPROVAL`, with `APPROVED | CHAMPION | LIVE` reserved for a human and
+**not orchestrator-writable**), and an append-only `ApprovalQueue` (pending
+entries; the orchestrator can only append, never approve/reject).
 
 ## Tools & Skills used
 
@@ -57,10 +81,7 @@ class OrchestrationOutcome:
 
 ## Model tier and why
 
-**Sonnet** (`claude-sonnet-4-6`) by default for full-cycle ticks (multi-step routing with state).
-**Haiku** (`claude-haiku-4-5-20251001`) for `status_check` ticks (read audit + champion stats, decide whether anything needs a full cycle). Haiku is fine for the easy case and lets us tick frequently for cheap.
-
-The tier is selected per `OrchestrationTick.cycle_kind`. **Switching tiers invalidates the cache** — keep the two tiers as separate cache lanes, do not interleave.
+**None — this component makes no LLM call.** The orchestrator is deterministic coordination code; the workers it invokes own their own tiers. The spec's earlier "Sonnet for full cycles / Haiku for status ticks" describes **`reporting_agent`'s** human-facing summarisation, which is deferred and built separately. (Per-worker tiers today: `market_context`/`strategy_lab`/`backtest_agent` on DEFAULT, `critic` on HEAVY.)
 
 ## System-prompt structure
 

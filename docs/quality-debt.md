@@ -9,12 +9,13 @@
 
 See `CLAUDE.md` → "Quality gate" for the policy. The enforced-clean set today is
 `core/models.py`, `core/strategy.py`, `core/backtest/`, `core/analysis/`,
-`core/agents/strategy_lab_agent.py`, `core/agents/backtest_harness.py`,
-`core/agents/backtest_agent.py`, `core/agents/critic_agent.py`,
-`core/broker.py`, `core/config.py`, `core/usage_accounting.py` — clean under all
-three tools, and `scripts/check.sh` keeps it that way. (The four `core/agents/*`
-entries are single-file promotions from an otherwise debt-laden `core/agents/`
-package.)
+`core/orchestration/`, `core/agents/strategy_lab_agent.py`,
+`core/agents/backtest_harness.py`, `core/agents/backtest_agent.py`,
+`core/agents/critic_agent.py`, `core/broker.py`, `core/config.py`,
+`core/usage_accounting.py` — clean under all three tools, and `scripts/check.sh`
+keeps it that way. (The four `core/agents/*` entries are single-file promotions
+from an otherwise debt-laden `core/agents/` package; `core/orchestration/` was
+built clean as a whole package.)
 
 ## How to read this
 
