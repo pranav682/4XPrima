@@ -27,7 +27,14 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -851,3 +858,139 @@ class PairProfile(BaseModel):
     @classmethod
     def _utc_only(cls, v: datetime | None) -> datetime | None:
         return None if v is None else _require_utc(v)
+
+
+# ---------------------------------------------------------------------------
+# Strategy proposals (strategy_lab_agent output)
+# ---------------------------------------------------------------------------
+
+
+class StrategyArchetype(StrEnum):
+    """The FIXED, code-defined set of strategy types the backtester can run.
+
+    The strategy_lab_agent may ONLY propose an archetype from this enum; it
+    cannot invent a strategy type the engine can't construct. Each archetype
+    maps to a concrete :class:`core.strategy.Strategy` builder in
+    ``core.strategy.STRATEGY_REGISTRY``. Add a value here only when the engine
+    actually supports it.
+    """
+
+    MA_CROSSOVER = "ma_crossover"
+
+
+_EXECUTION_INTENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bgo(?:ing)?\s+live\b", re.IGNORECASE),
+    re.compile(r"\blive[\s-]?trad(?:e|es|ing)\b", re.IGNORECASE),
+    re.compile(r"\bdeploy(?:ing|ment|ed)?\b", re.IGNORECASE),
+    re.compile(r"\b(?:place|send|route|submit|fire)\s+(?:the\s+|a\s+)?orders?\b", re.IGNORECASE),
+    re.compile(r"\bexecute\s+(?:the\s+|a\s+)?(?:trade|order|position)s?\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:enable|activate|turn\s+on)\s+(?:live|real[\s-]?money|trading)\b", re.IGNORECASE
+    ),
+    re.compile(r"\breal[\s-]?money\b", re.IGNORECASE),
+)
+
+
+def _scrub_execution_intent(field_name: str, text: str) -> str:
+    """Reject any language that signals intent to EXECUTE / DEPLOY / trade live.
+
+    The strategy lab proposes specs for the backtester to judge — it must never
+    signal that anything should be traded live. Belt-and-braces machine check
+    mirroring :func:`_scrub_trade_calls`; the agent prompt also forbids it.
+    """
+    for pattern in _EXECUTION_INTENT_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            raise ValueError(
+                f"execution/deployment language in {field_name}: matched {m.group()!r}"
+            )
+    return text
+
+
+class StrategyParam(BaseModel):
+    """One concrete parameter value (e.g. ``fast_period = 10``)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    value: Decimal
+
+
+class ParamRange(BaseModel):
+    """A bounded range one parameter's optimizer may explore later.
+
+    The optimization_agent's sandbox: ``[low, high]`` inclusive. Validated as
+    sane here (``low < high``); archetype-specific limits are enforced against
+    ``core.strategy.STRATEGY_REGISTRY``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    low: Decimal
+    high: Decimal
+
+    @model_validator(mode="after")
+    def _low_below_high(self) -> ParamRange:
+        if self.low >= self.high:
+            raise ValueError(f"param {self.name!r} range low {self.low} >= high {self.high}")
+        return self
+
+
+class StrategyCandidate(BaseModel):
+    """A single proposed strategy SPEC the deterministic backtester can run.
+
+    **The agent proposes; it does not run, optimize, execute, or approve.**
+    The archetype is restricted to :class:`StrategyArchetype`; the instrument
+    to the allowed universe; and every candidate must be constructible into a
+    real :class:`core.strategy.Strategy` before the output is accepted. There
+    is NO execution / deployment / live-trading field anywhere, and the
+    free-text ``rationale`` is scrubbed for execution intent.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    candidate_id: str
+    run_id: str
+    archetype: StrategyArchetype
+    instrument: str
+    timeframe: Granularity
+    parameters: tuple[StrategyParam, ...]
+    parameter_ranges: tuple[ParamRange, ...]
+    rationale: str  # ties the proposal to the MarketContextReport
+
+    @field_validator("instrument")
+    @classmethod
+    def _normalize_instrument(cls, v: str) -> str:
+        if not v or not v.isalpha():
+            raise ValueError("instrument must be alphabetic, e.g. 'EURUSD'")
+        return v.upper()
+
+    @field_validator("rationale")
+    @classmethod
+    def _no_execution_intent(cls, v: str) -> str:
+        if len(v) > 500:
+            raise ValueError("rationale must be ≤ 500 chars")
+        return _scrub_execution_intent("rationale", v)
+
+    def params_as_dict(self) -> dict[str, Decimal]:
+        return {p.name: p.value for p in self.parameters}
+
+    def ranges_as_dict(self) -> dict[str, ParamRange]:
+        return {r.name: r for r in self.parameter_ranges}
+
+
+class StrategyProposal(BaseModel):
+    """The strategy_lab_agent's structured output: a small set of candidates."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: str
+    as_of: datetime
+    schema_version: str = "1.0"
+    candidates: tuple[StrategyCandidate, ...] = ()
+
+    @field_validator("as_of")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)

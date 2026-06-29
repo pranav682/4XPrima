@@ -28,7 +28,8 @@ Signal timing convention:
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -38,6 +39,9 @@ from core.models import (
     Candle,
     Direction,
     OrderRequest,
+    ParamRange,
+    StrategyArchetype,
+    StrategyCandidate,
 )
 
 # ---------------------------------------------------------------------------
@@ -287,9 +291,160 @@ class MovingAverageCrossover:
         return signals
 
 
+# ---------------------------------------------------------------------------
+# Strategy archetype registry — the FIXED catalog the strategy_lab_agent may
+# propose from. Each archetype maps to a concrete, constructible Strategy.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ParamSpec:
+    """Hard limits for one archetype parameter — the outer fence the agent's
+    proposed ``parameter_ranges`` must sit inside."""
+
+    name: str
+    minimum: Decimal
+    maximum: Decimal
+    integer: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ArchetypeSpec:
+    """One entry in the registry: how to validate + build an archetype.
+
+    ``builder`` takes ``(instrument, params)`` and returns a real
+    :class:`Strategy`. It is the SOLE bridge from a proposed
+    :class:`core.models.StrategyCandidate` to something the engine can run.
+    """
+
+    archetype: StrategyArchetype
+    description: str
+    param_specs: tuple[ParamSpec, ...]
+    builder: Callable[[str, dict[str, Decimal]], Strategy]
+
+    def param_names(self) -> frozenset[str]:
+        return frozenset(ps.name for ps in self.param_specs)
+
+
+def _build_ma_crossover(instrument: str, params: dict[str, Decimal]) -> Strategy:
+    return MovingAverageCrossover(
+        pair=instrument,
+        fast_period=int(params["fast_period"]),
+        slow_period=int(params["slow_period"]),
+        size=params["size"],
+        stop_distance=params["stop_distance"],
+    )
+
+
+STRATEGY_REGISTRY: dict[StrategyArchetype, ArchetypeSpec] = {
+    StrategyArchetype.MA_CROSSOVER: ArchetypeSpec(
+        archetype=StrategyArchetype.MA_CROSSOVER,
+        description=(
+            "Moving-average crossover. Long when the fast MA crosses above the "
+            "slow MA, short on the reverse cross. Single pair, fixed size, "
+            "fixed-distance stop. Requires fast_period < slow_period."
+        ),
+        param_specs=(
+            ParamSpec("fast_period", Decimal("2"), Decimal("200"), integer=True),
+            ParamSpec("slow_period", Decimal("3"), Decimal("400"), integer=True),
+            ParamSpec("size", Decimal("1"), Decimal("10000000"), integer=False),
+            ParamSpec("stop_distance", Decimal("0.0001"), Decimal("0.5"), integer=False),
+        ),
+        builder=_build_ma_crossover,
+    ),
+}
+
+
+def archetype_catalog() -> str:
+    """Deterministic human-readable catalog of the registry, for the agent's
+    stable system prefix. Byte-stable across processes (sorted), so it doesn't
+    break OpenAI prompt caching."""
+    lines: list[str] = []
+    for archetype in sorted(STRATEGY_REGISTRY, key=lambda a: a.value):
+        spec = STRATEGY_REGISTRY[archetype]
+        lines.append(f"- {archetype.value}: {spec.description}")
+        for ps in spec.param_specs:
+            kind = "integer" if ps.integer else "decimal"
+            lines.append(f"    * {ps.name} ({kind}) in [{ps.minimum}, {ps.maximum}]")
+    return "\n".join(lines)
+
+
+def validate_candidate(candidate: StrategyCandidate) -> tuple[str, ...]:
+    """Deterministic structural validation of a proposed candidate.
+
+    Returns a tuple of error strings (empty == valid). Checks archetype
+    membership, that the parameter / range key sets exactly match the
+    archetype, that each declared range sits inside the archetype's hard
+    limits with ``low < high``, integer-ness, and that each concrete value
+    sits inside both the archetype limits and its own declared range. Does
+    NOT construct — see :func:`build_strategy` for the constructibility check.
+    """
+    spec = STRATEGY_REGISTRY.get(candidate.archetype)
+    if spec is None:
+        return (f"unknown archetype {candidate.archetype!r}",)
+
+    errors: list[str] = []
+    params = candidate.params_as_dict()
+    ranges: dict[str, ParamRange] = candidate.ranges_as_dict()
+    expected = spec.param_names()
+    if frozenset(params) != expected:
+        errors.append(f"parameters {sorted(params)} != required {sorted(expected)}")
+    if frozenset(ranges) != expected:
+        errors.append(f"parameter_ranges {sorted(ranges)} != required {sorted(expected)}")
+
+    for ps in spec.param_specs:
+        rng = ranges.get(ps.name)
+        if rng is not None:
+            if rng.low >= rng.high:
+                errors.append(f"{ps.name} range low {rng.low} >= high {rng.high}")
+            if rng.low < ps.minimum or rng.high > ps.maximum:
+                errors.append(
+                    f"{ps.name} range [{rng.low}, {rng.high}] outside archetype "
+                    f"limits [{ps.minimum}, {ps.maximum}]"
+                )
+            if ps.integer and (
+                rng.low != rng.low.to_integral_value() or rng.high != rng.high.to_integral_value()
+            ):
+                errors.append(f"{ps.name} is integer; range bounds must be whole")
+        val = params.get(ps.name)
+        if val is not None:
+            if ps.integer and val != val.to_integral_value():
+                errors.append(f"{ps.name} must be an integer, got {val}")
+            if val < ps.minimum or val > ps.maximum:
+                errors.append(
+                    f"{ps.name} value {val} outside archetype limits "
+                    f"[{ps.minimum}, {ps.maximum}]"
+                )
+            if rng is not None and not (rng.low <= val <= rng.high):
+                errors.append(
+                    f"{ps.name} value {val} outside its declared range " f"[{rng.low}, {rng.high}]"
+                )
+    return tuple(errors)
+
+
+def build_strategy(candidate: StrategyCandidate) -> Strategy:
+    """Construct the real :class:`Strategy` for a candidate.
+
+    Raises ``ValueError`` / ``KeyError`` if the archetype is unknown, a
+    parameter is missing, or the archetype's own constructor rejects the
+    values (e.g. ``fast_period >= slow_period``). Callers treat any exception
+    as "not constructible" — that's the hard gate before a candidate ships.
+    """
+    spec = STRATEGY_REGISTRY.get(candidate.archetype)
+    if spec is None:
+        raise ValueError(f"unknown archetype {candidate.archetype!r}")
+    return spec.builder(candidate.instrument, candidate.params_as_dict())
+
+
 __all__ = [
+    "STRATEGY_REGISTRY",
+    "ArchetypeSpec",
     "LookAheadError",
     "MovingAverageCrossover",
+    "ParamSpec",
     "PointInTimeView",
     "Strategy",
+    "archetype_catalog",
+    "build_strategy",
+    "validate_candidate",
 ]

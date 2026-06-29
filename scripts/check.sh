@@ -31,6 +31,7 @@ ENFORCED=(
   core/strategy.py          # strategy contract + reference strategy
   core/backtest/            # deterministic backtester
   core/analysis/            # structural pair screener
+  core/agents/strategy_lab_agent.py  # strategy proposal agent (rest of core/agents/ is debt)
   core/broker.py            # broker Protocol
   core/config.py            # pydantic-settings config
   core/usage_accounting.py  # per-agent token/cache log
