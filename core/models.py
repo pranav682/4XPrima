@@ -31,6 +31,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    WithJsonSchema,
     computed_field,
     field_validator,
     model_validator,
@@ -100,6 +101,15 @@ def _require_utc(value: datetime) -> datetime:
 PositiveDecimal = Annotated[Decimal, Field(gt=Decimal("0"))]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=Decimal("0"))]
 NonNegativeInt = Annotated[int, Field(ge=0)]
+
+# A Decimal whose JSON schema is a plain string. pydantic's default Decimal
+# schema includes a regex `pattern` with a negative lookahead, which OpenAI's
+# Structured-Outputs strict mode REJECTS ("regex lookaround is not supported")
+# — and the stricter HEAVY-tier model enforces it. Emitting Decimals as strings
+# also makes the LLM's verbatim copy EXACT (no float round-trip). Runtime type
+# is still Decimal; only the generated schema changes. Use this for every
+# Decimal field in an agent's OUTPUT model.
+JsonDecimal = Annotated[Decimal, WithJsonSchema({"type": "string"})]
 LossPercentDecimal = Annotated[Decimal, Field(gt=Decimal("0"), le=Decimal("1"))]
 """A loss-side fractional percent in (0, 1] — used for caps that measure a
 loss against equity (per-trade risk, portfolio risk, daily loss, drawdown).
@@ -913,7 +923,7 @@ class StrategyParam(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     name: str
-    value: Decimal
+    value: JsonDecimal
 
 
 class ParamRange(BaseModel):
@@ -927,8 +937,8 @@ class ParamRange(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     name: str
-    low: Decimal
-    high: Decimal
+    low: JsonDecimal
+    high: JsonDecimal
 
     @model_validator(mode="after")
     def _low_below_high(self) -> ParamRange:
@@ -1024,15 +1034,15 @@ class BacktestMetricsView(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    total_return_pct: Decimal
-    annualised_return_pct: Decimal
+    total_return_pct: JsonDecimal
+    annualised_return_pct: JsonDecimal
     sharpe_ratio: float
     sortino_ratio: float | None  # None = no downside (undefined / infinite)
-    max_drawdown_pct: Decimal
+    max_drawdown_pct: JsonDecimal
     win_rate: float
     profit_factor: float | None  # None = no losing trades (undefined / infinite)
     trade_count: int
-    avg_trade_pnl: Decimal
+    avg_trade_pnl: JsonDecimal
     exposure_pct: float
 
     def differing_fields(self, other: BacktestMetricsView) -> tuple[str, ...]:
