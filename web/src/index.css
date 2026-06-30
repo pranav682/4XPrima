@@ -1,0 +1,86 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens — see web/DESIGN.md for the rationale.
+ * Near-monochrome dark surface ramp + ONE accent. Color carries STATUS, never
+ * decoration. SURVIVED_FOR_NOW is amber (caution / "not yet killed"), never
+ * green — the UI must not imply validation the critic never gave.
+ */
+:root {
+  --background: 240 6% 5%;
+  --surface: 240 5% 8%;
+  --elevated: 240 5% 11%;
+  --border: 240 4% 16%;
+  --ring: 245 80% 66%;
+  --foreground: 0 0% 95%;
+  --muted: 240 4% 14%;
+  --muted-foreground: 240 5% 62%;
+
+  /* The single functional accent. */
+  --accent: 245 80% 66%;
+  --accent-foreground: 0 0% 100%;
+
+  /* Status semantics. */
+  --killed: 0 72% 60%; /* terminated / negative */
+  --survived: 38 92% 56%; /* caution — NOT validated, NOT green */
+  --neutral-status: 217 30% 62%; /* process facts (cycle completed), calm */
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Align financial figures: tabular, mono. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Visible, consistent focus for full keyboard nav (WCAG). */
+:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Subtle skeleton shimmer (respects reduced-motion above). */
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+.skeleton {
+  background: hsl(var(--muted));
+  border-radius: 6px;
+  animation: pulse-soft 1.6s ease-in-out infinite;
+}

@@ -39,7 +39,12 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--universe", nargs="+", default=list(DEFAULT_UNIVERSE), help="Pairs covered.")
     p.add_argument("--tier", choices=sorted(_TIERS), default="default", help="LLM tier.")
-    p.add_argument("--out", type=Path, default=Path("samples"), help="Report output dir.")
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=Path("data/orchestration/reports"),
+        help="Report output dir (the dashboard API reads reports from here).",
+    )
     return p.parse_args()
 
 

@@ -62,7 +62,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--state-dir", type=Path, default=Path("data/orchestration"), help="Registry + queue dir."
     )
-    p.add_argument("--out", type=Path, default=Path("samples"), help="Cycle summary dir.")
+    p.add_argument(
+        "--out",
+        type=Path,
+        default=Path("data/orchestration/cycles"),
+        help="Cycle summary dir (the dashboard API reads cycles from here).",
+    )
     return p.parse_args()
 
 

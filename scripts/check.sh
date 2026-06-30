@@ -40,6 +40,12 @@ ENFORCED=(
   core/broker.py            # broker Protocol
   core/config.py            # pydantic-settings config
   core/usage_accounting.py  # per-agent token/cache log
+  # Read-only web dashboard API (imports core, serializes verbatim). Python only;
+  # the web/ frontend is NOT part of this gate. Tests live in api/tests/.
+  api/config.py
+  api/store.py
+  api/serializers.py
+  api/main.py
 )
 
 fail=0
