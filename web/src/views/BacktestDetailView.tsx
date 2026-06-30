@@ -125,6 +125,10 @@ function EquityCurvePanel({ notice, available }: { notice: string; available: bo
         <div className="flex flex-col items-center gap-2.5 rounded-md border border-dashed border-border bg-background/40 py-10 text-center">
           <LineChart className="h-5 w-5 text-muted-foreground" aria-hidden />
           <p className="mx-auto max-w-md text-xs text-muted-foreground">{notice}</p>
+          <p className="mx-auto max-w-md text-2xs text-muted-foreground/80">
+            Once per-bar equity points are persisted (a later slice), the equity curve will render
+            here.
+          </p>
         </div>
       </CardContent>
     </Card>

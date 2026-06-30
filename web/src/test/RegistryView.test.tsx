@@ -29,6 +29,10 @@ describe("RegistryView", () => {
 
     expect(screen.getByText(/USDJPY · H1/)).toBeInTheDocument();
     expect(screen.getByText(/EURUSD · H1/)).toBeInTheDocument();
+
+    // The statistical-power caveat travels onto the registry card too: the
+    // survivor's OOS Sharpe rests on 6 trades and must not be shown bare.
+    expect(screen.getByText(/limited statistical power/i)).toBeInTheDocument();
   });
 
   it("shows the empty state when there are no candidates", async () => {

@@ -31,9 +31,11 @@ describe("ApprovalQueueView", () => {
 
     // No actionable approve/reject button exists yet.
     expect(screen.queryByRole("button", { name: /approve|reject/i })).toBeNull();
-    // The action slot is present but inert (reserved for a later slice).
+    // The action slot is present but inert, and clearly labelled as future —
+    // so it reads as "coming later", not "broken".
     const slot = screen.getByText("Operator decision");
     expect(slot).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByText("enabled in a later slice")).toBeInTheDocument();
     expect(screen.getByText(/Read-only\./)).toBeInTheDocument();
   });
 

@@ -6,6 +6,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { Card, CardContent } from "@/components/ui/card";
 import { VerdictBadge } from "@/components/status";
 import { ConcernList } from "@/components/ConcernList";
+import { SampleCaveat } from "@/components/SampleCaveat";
 import { Stat } from "@/components/ui/misc";
 import { num, pct, titleCase } from "@/lib/format";
 import type { ApprovalItem, Metrics } from "@/lib/types";
@@ -75,11 +76,14 @@ function QueueItem({ item }: { item: ApprovalItem }) {
             <h3 className="mb-2 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
               Metrics (in-sample → out-of-sample)
             </h3>
-            <div className="grid grid-cols-2 gap-3 rounded-md border border-border bg-elevated/50 px-3 py-3">
-              <MetricPair label="Sharpe" is={num(ins.sharpe_ratio)} oos={oos ? num(oos.sharpe_ratio) : "—"} />
-              <MetricPair label="Return" is={pct(ins.total_return_pct)} oos={oos ? pct(oos.total_return_pct) : "—"} />
-              <MetricPair label="Profit factor" is={fmtRatio(ins)} oos={oos ? fmtRatio(oos) : "—"} />
-              <MetricPair label="Trades" is={String(ins.trade_count)} oos={oos ? String(oos.trade_count) : "—"} />
+            <div className="rounded-md border border-border bg-elevated/50 px-3 py-3">
+              <div className="grid grid-cols-2 gap-3">
+                <MetricPair label="Sharpe" is={num(ins.sharpe_ratio)} oos={oos ? num(oos.sharpe_ratio) : "—"} />
+                <MetricPair label="Return" is={pct(ins.total_return_pct)} oos={oos ? pct(oos.total_return_pct) : "—"} />
+                <MetricPair label="Profit factor" is={fmtRatio(ins)} oos={oos ? fmtRatio(oos) : "—"} />
+                <MetricPair label="Trades" is={String(ins.trade_count)} oos={oos ? String(oos.trade_count) : "—"} />
+              </div>
+              <SampleCaveat metrics={oos} className="mt-2.5" />
             </div>
           </section>
         </div>
@@ -113,12 +117,15 @@ function ActionPlaceholder() {
         <Lock className="h-3.5 w-3.5" aria-hidden />
         Read-only. Approval is a human action handled outside this dashboard (a later slice).
       </span>
-      <span
-        aria-disabled="true"
-        className="cursor-not-allowed select-none rounded-md border border-border px-3 py-1 text-2xs font-medium text-muted-foreground opacity-60"
-        title="Not available in this read-only slice"
-      >
-        Operator decision
+      <span className="flex flex-col items-end gap-0.5">
+        <span
+          aria-disabled="true"
+          className="cursor-not-allowed select-none rounded-md border border-border px-3 py-1 text-2xs font-medium text-muted-foreground opacity-70"
+          title="Enabled in a later slice — this dashboard is read-only"
+        >
+          Operator decision
+        </span>
+        <span className="text-[10px] text-muted-foreground">enabled in a later slice</span>
       </span>
     </div>
   );

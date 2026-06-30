@@ -6,6 +6,7 @@ import { AsyncBoundary, EmptyState } from "@/components/StateViews";
 import { PageHeader } from "@/components/PageHeader";
 import { Card, CardContent } from "@/components/ui/card";
 import { StateBadge, VerdictBadge } from "@/components/status";
+import { SampleCaveat } from "@/components/SampleCaveat";
 import { cn } from "@/lib/utils";
 import { num, pct, shortHash, titleCase } from "@/lib/format";
 import type { Candidate, RegistryEntry } from "@/lib/types";
@@ -81,7 +82,7 @@ function EntryCard({ entry }: { entry: RegistryEntry }) {
   return (
     <Card
       className={cn(
-        "flex flex-col",
+        "flex h-full flex-col",
         killed && "opacity-75",
         killed ? "border-killed/30" : "border-survived/30",
       )}
@@ -102,14 +103,18 @@ function EntryCard({ entry }: { entry: RegistryEntry }) {
           {paramSummary(entry.candidate)}
         </p>
 
-        <div className="grid grid-cols-2 gap-3 rounded-md border border-border bg-elevated/50 px-3 py-2">
-          <MiniMetric label="In-sample Sharpe" value={ins ? num(ins.metrics.sharpe_ratio) : "—"} sub={ins ? pct(ins.metrics.total_return_pct) : undefined} />
-          <MiniMetric
-            label="Out-of-sample Sharpe"
-            value={oos ? num(oos.metrics.sharpe_ratio) : "—"}
-            sub={oos ? pct(oos.metrics.total_return_pct) : "not opened"}
-            emphasize
-          />
+        <div className="rounded-md border border-border bg-elevated/50 px-3 py-2">
+          <div className="grid grid-cols-2 gap-3">
+            <MiniMetric label="In-sample Sharpe" value={ins ? num(ins.metrics.sharpe_ratio) : "—"} sub={ins ? pct(ins.metrics.total_return_pct) : undefined} />
+            <MiniMetric
+              label="Out-of-sample Sharpe"
+              value={oos ? num(oos.metrics.sharpe_ratio) : "—"}
+              sub={oos ? pct(oos.metrics.total_return_pct) : "not opened"}
+              emphasize
+            />
+          </div>
+          {/* The caveat travels with the metric — same rule as the approval queue. */}
+          <SampleCaveat metrics={oos?.metrics} className="mt-2" />
         </div>
 
         <div className="mt-auto flex items-center justify-between gap-2 pt-1">

@@ -21,6 +21,9 @@ describe("CyclesView", () => {
     // Decimal cost passes through verbatim as a string, not floated.
     expect(screen.getByText("$0.1734")).toBeInTheDocument();
     expect(screen.getByText("Completed")).toBeInTheDocument();
+    // Plain-language narrative de-alarms the kill count (kills = system working).
+    expect(screen.getByText(/2 rejected by critic/)).toBeInTheDocument();
+    expect(screen.getByText(/1 queued for review/)).toBeInTheDocument();
   });
 
   it("shows a designed empty state on day one", async () => {

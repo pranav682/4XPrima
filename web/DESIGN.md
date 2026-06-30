@@ -71,7 +71,22 @@ The UI must editorialize **no more than the reporting agent does**.
    trade count is shown next to an explicit "limited statistical power" caution.
    We never recompute or smooth a value — money/ratio figures arrive as verbatim
    strings from the API and are only formatted for reading.
-5. **Honest empty/loading/error states**, never a void or a fabricated chart.
+5. **The caveat travels with the metric — everywhere.** A metric's
+   trustworthiness caveat (e.g. a thin trade count → weak statistical power) must
+   appear *wherever that metric is shown*, not only on one screen. The shared
+   `sampleCaveat()` / `<SampleCaveat>` derive the caveat from the metric itself
+   (its trade count) and render the same amber caution on the registry cards, the
+   approval queue, and the backtest comparison alike. A survivor's OOS Sharpe is
+   never shown bare. (Implemented in `src/lib/caveats.ts`.)
+6. **A metric increase is not "good".** An in-sample→out-of-sample jump is shown
+   with a NEUTRAL arrow, never green/positive — on a small sample a jump is noise,
+   not improvement. Color stays reserved for verdict/status, never for deltas.
+7. **Kills are the system working, not errors.** The critic rejecting weak
+   candidates is the expected, healthy path, so kill *counts* read neutral; red is
+   reserved for genuine failures (cycle aborted, budget breach, worker error).
+   Each cycle row carries a plain-language summary ("2 proposed · both rejected by
+   critic · none queued") so the numbers aren't mistaken for alarms.
+8. **Honest empty/loading/error states**, never a void or a fabricated chart.
    The equity curve isn't persisted in `BacktestEvidence` and the API must not
    re-derive it, so we say so plainly instead of drawing a fake line; the
    in-sample→OOS comparison is the real centerpiece.

@@ -16,6 +16,7 @@ import {
 } from "recharts";
 import { Table, TBody, TD, TH, THead, TR } from "@/components/ui/table";
 import { pct, num, ratioOrNull } from "@/lib/format";
+import { isThinSample } from "@/lib/caveats";
 import type { Metrics } from "@/lib/types";
 
 const IS_COLOR = "hsl(217, 30%, 62%)"; // slate — in-sample
@@ -46,7 +47,7 @@ export function MetricComparison({
       : [];
 
   const oosTrades = outOfSample?.trade_count ?? null;
-  const thinOos = oosTrades != null && oosTrades < 30;
+  const thinOos = isThinSample(outOfSample);
 
   return (
     <div className="flex flex-col gap-5">

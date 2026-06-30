@@ -15,6 +15,25 @@ function OutcomeBadge({ outcome }: { outcome: CycleOutcome }) {
   return <Badge tone={tone}>{titleCase(outcome)}</Badge>;
 }
 
+/** Plain-language summary of a completed cycle. Kills are the system working
+ *  (the critic rejecting weak candidates), so this reads matter-of-factly — red
+ *  is reserved for genuine failures (aborts), surfaced by the OutcomeBadge. */
+function cycleNarrative(c: CycleSummary): string {
+  if (c.outcome !== "completed") {
+    return c.abort_reason ? `Aborted — ${c.abort_reason}` : "Aborted before completing.";
+  }
+  const { candidates_proposed: n, candidates_killed: k, candidates_queued: q } = c;
+  if (n === 0) return "No candidates proposed.";
+  const killed =
+    k === 0
+      ? "none rejected"
+      : k === n
+        ? `${n === 2 ? "both" : "all"} rejected by critic`
+        : `${k} rejected by critic`;
+  const queued = q === 0 ? "none queued" : `${q} queued for review`;
+  return `${n} proposed · ${killed} · ${queued}`;
+}
+
 export function CyclesView() {
   const state = useApi<CycleSummary[]>(() => api.cycles(), []);
   return (
@@ -59,20 +78,32 @@ function CyclesTable({ cycles }: { cycles: CycleSummary[] }) {
           {cycles.map((c) => (
             <TR key={c.cycle_id} className="hover:bg-elevated/60">
               <TD>
-                <Link
-                  to={`/cycles/${c.cycle_id}`}
-                  className="font-medium text-foreground underline-offset-2 hover:text-accent hover:underline"
-                >
-                  {c.cycle_id}
-                </Link>
+                <div className="flex flex-col gap-0.5">
+                  <Link
+                    to={`/cycles/${c.cycle_id}`}
+                    className="font-medium text-foreground underline-offset-2 hover:text-accent hover:underline"
+                  >
+                    {c.cycle_id}
+                  </Link>
+                  <span className="text-2xs text-muted-foreground">{cycleNarrative(c)}</span>
+                </div>
               </TD>
               <TD className="tnum text-muted-foreground">{dateUTC(c.started_at)}</TD>
               <TD>
                 <OutcomeBadge outcome={c.outcome} />
               </TD>
               <TD className="text-right tnum">{c.candidates_proposed}</TD>
-              <TD className="text-right tnum text-killed">{c.candidates_killed}</TD>
-              <TD className="text-right tnum text-survived">{c.candidates_queued}</TD>
+              {/* Kills are an expected, healthy outcome — neutral, not alarming. */}
+              <TD className="text-right tnum text-foreground">{c.candidates_killed}</TD>
+              <TD
+                className={
+                  c.candidates_queued > 0
+                    ? "text-right tnum text-survived"
+                    : "text-right tnum text-muted-foreground"
+                }
+              >
+                {c.candidates_queued}
+              </TD>
               <TD className="text-right tnum">{money(c.total_cost_usd)}</TD>
               <TD className="text-right tnum text-muted-foreground">{duration(c.duration_seconds)}</TD>
             </TR>
