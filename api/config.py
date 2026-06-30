@@ -44,5 +44,9 @@ class ApiSettings(BaseSettings):
     def reports_dir(self) -> Path:
         return self.data_dir / "reports"
 
+    @property
+    def artifacts_dir(self) -> Path:
+        return self.data_dir / "backtests"
+
 
 __all__ = ["ApiSettings"]

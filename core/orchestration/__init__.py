@@ -7,6 +7,7 @@ a human approval queue. It cannot promote, trade, or touch sacred config — see
 """
 
 from core.orchestration.approval_queue import ApprovalQueue, ApprovalQueueEntry
+from core.orchestration.artifact_store import BacktestArtifactStore
 from core.orchestration.orchestrator import (
     CycleOutcome,
     CycleResult,
@@ -23,6 +24,7 @@ from core.orchestration.registry import (
 __all__ = [
     "ApprovalQueue",
     "ApprovalQueueEntry",
+    "BacktestArtifactStore",
     "ChampionChallengerRegistry",
     "CycleOutcome",
     "CycleResult",

@@ -131,6 +131,34 @@ export interface ApprovalItem {
   report_explanation: string | null;
 }
 
+export interface EquityCurvePoint {
+  bar_index: number;
+  time: string;
+  equity: string;
+  drawdown_pct: string;
+}
+
+export interface BacktestArtifact {
+  config_hash: string;
+  candidate_id: string;
+  pair: string;
+  segment: EvidenceSegment;
+  window_start: string;
+  window_end: string;
+  starting_balance: string;
+  ending_balance: string;
+  ending_equity: string;
+  peak_equity: string;
+  net_pnl: string;
+  return_pct: string;
+  max_drawdown_pct: string;
+  trade_count: number;
+  cost_total: string;
+  bars_processed: number;
+  halted_due_to_kill_switch: boolean;
+  equity_curve: EquityCurvePoint[];
+}
+
 export interface BacktestDetail {
   config_hash: string;
   identity: string;
@@ -139,7 +167,8 @@ export interface BacktestDetail {
   in_sample: Evidence | null;
   out_of_sample: Evidence | null;
   critic_verdict: CriticVerdict | null;
-  equity_curve: unknown[];
+  in_sample_artifact: BacktestArtifact | null;
+  out_of_sample_artifact: BacktestArtifact | null;
   equity_curve_available: boolean;
   equity_curve_notice: string;
 }

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from api.config import ApiSettings
 from api.main import create_app
 from core.models import (
+    BacktestArtifact,
     BacktestEvidence,
     BacktestMetricsView,
     ChecklistItem,
@@ -24,6 +25,7 @@ from core.models import (
     CriticVerdictKind,
     CycleReport,
     CycleReportSummary,
+    EquityCurvePoint,
     EvidenceSegment,
     Granularity,
     OverfittingConcern,
@@ -32,7 +34,12 @@ from core.models import (
     StrategyCandidate,
     StrategyParam,
 )
-from core.orchestration import ApprovalQueueEntry, RegistryEntry, RegistryState
+from core.orchestration import (
+    ApprovalQueueEntry,
+    BacktestArtifactStore,
+    RegistryEntry,
+    RegistryState,
+)
 from core.orchestration.orchestrator import CycleOutcome, CycleResult
 
 BASE = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
@@ -257,6 +264,40 @@ def _report() -> CycleReport:
     )
 
 
+def _artifact(config_hash: str, segment: EvidenceSegment, net: str) -> BacktestArtifact:
+    start = Decimal("100000")
+    end = start + Decimal(net)
+    curve = tuple(
+        EquityCurvePoint(
+            bar_index=i,
+            time=BASE + timedelta(hours=i),
+            equity=start + (Decimal(net) * Decimal(i) / Decimal(4)),
+            drawdown_pct=Decimal("0.00"),
+        )
+        for i in range(5)
+    )
+    return BacktestArtifact(
+        config_hash=config_hash,
+        candidate_id="cand-survivor",
+        pair="USDJPY",
+        segment=segment,
+        window_start=BASE,
+        window_end=BASE + timedelta(hours=4),
+        starting_balance=start,
+        ending_balance=end,
+        ending_equity=end,
+        peak_equity=end if end > start else start,
+        net_pnl=Decimal(net),
+        return_pct=Decimal(net) / start,
+        max_drawdown_pct=Decimal("0.02"),
+        trade_count=40 if segment == EvidenceSegment.IN_SAMPLE else 6,
+        cost_total=Decimal("214.50"),
+        bars_processed=5,
+        halted_due_to_kill_switch=False,
+        equity_curve=curve,
+    )
+
+
 def _write_store(path: Path, entries: dict[str, Any]) -> None:
     path.write_text(json.dumps({"schema_version": "1.0", "entries": entries}, default=str))
 
@@ -279,6 +320,12 @@ def _seed(data_dir: Path) -> None:
     for cycle in (_cycle(), _older_cycle()):
         (data_dir / "cycles" / f"{cycle.cycle_id}.json").write_text(cycle.model_dump_json())
     (data_dir / "reports" / f"{CYCLE_ID}.json").write_text(_report().model_dump_json())
+
+    # Equity-curve artifacts for the SURVIVOR only (the killed candidate has
+    # none, so the "honestly unavailable" path stays testable).
+    artifacts = BacktestArtifactStore(data_dir / "backtests")
+    artifacts.save(_artifact(SURVIVOR_HASH, EvidenceSegment.IN_SAMPLE, "8200"))
+    artifacts.save(_artifact(SURVIVOR_OOS_HASH, EvidenceSegment.OUT_OF_SAMPLE, "360"))
 
 
 @pytest.fixture

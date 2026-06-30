@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.models import CycleReport
+from core.models import BacktestArtifact, CycleReport
 from core.orchestration import ApprovalQueueEntry, CycleResult, RegistryEntry
 
 # Curve points are not persisted in BacktestEvidence (only summary metrics are),
@@ -64,10 +64,17 @@ def approval_item(entry: ApprovalQueueEntry, report: CycleReport | None) -> dict
     return data
 
 
-def backtest_detail(config_hash: str, entry: RegistryEntry) -> dict[str, Any]:
+def backtest_detail(
+    config_hash: str,
+    entry: RegistryEntry,
+    *,
+    in_sample_artifact: BacktestArtifact | None = None,
+    out_of_sample_artifact: BacktestArtifact | None = None,
+) -> dict[str, Any]:
     ins = entry.in_sample_evidence
     oos = entry.out_of_sample_evidence
     verdict = entry.critic_verdict
+    have_curve = in_sample_artifact is not None or out_of_sample_artifact is not None
     return {
         "config_hash": config_hash,
         "identity": entry.identity,
@@ -76,9 +83,17 @@ def backtest_detail(config_hash: str, entry: RegistryEntry) -> dict[str, Any]:
         "in_sample": ins.model_dump(mode="json") if ins is not None else None,
         "out_of_sample": oos.model_dump(mode="json") if oos is not None else None,
         "critic_verdict": verdict.model_dump(mode="json") if verdict is not None else None,
-        "equity_curve": [],
-        "equity_curve_available": False,
-        "equity_curve_notice": EQUITY_CURVE_NOTICE,
+        # Rich artifacts (equity curve + annotations), verbatim, when persisted.
+        "in_sample_artifact": (
+            in_sample_artifact.model_dump(mode="json") if in_sample_artifact is not None else None
+        ),
+        "out_of_sample_artifact": (
+            out_of_sample_artifact.model_dump(mode="json")
+            if out_of_sample_artifact is not None
+            else None
+        ),
+        "equity_curve_available": have_curve,
+        "equity_curve_notice": "" if have_curve else EQUITY_CURVE_NOTICE,
     }
 
 

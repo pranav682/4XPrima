@@ -42,6 +42,7 @@ from core.agents.backtest_agent import BacktestAgentRequest
 from core.agents.backtest_harness import (
     BacktestRunConfig,
     HarnessError,
+    run_candidate_artifacts,
     run_proposal,
     run_robustness,
 )
@@ -64,6 +65,7 @@ from core.models import (
     StrategyProposal,
 )
 from core.orchestration.approval_queue import ApprovalQueue
+from core.orchestration.artifact_store import BacktestArtifactStore
 from core.orchestration.registry import (
     ChampionChallengerRegistry,
     RegistryState,
@@ -156,6 +158,7 @@ class Orchestrator:
         candle_provider: CandleProvider,
         registry: ChampionChallengerRegistry,
         approval_queue: ApprovalQueue,
+        artifact_store: BacktestArtifactStore | None = None,
         config: OrchestratorConfig | None = None,
         logger: structlog.stdlib.BoundLogger | None = None,
     ) -> None:
@@ -167,6 +170,10 @@ class Orchestrator:
         self._candle_provider = candle_provider
         self._registry = registry
         self._queue = approval_queue
+        # Optional: when provided, the rich per-bar equity-curve artifacts for
+        # critiqued candidates are persisted here for the read-only dashboard.
+        # Does not affect routing, evidence, or the LLM prompts.
+        self._artifact_store = artifact_store
         self._config = config or OrchestratorConfig()
         self._logger = (logger if logger is not None else _default_logger()).bind(
             component="orchestrator"
@@ -344,6 +351,7 @@ class Orchestrator:
                 continue
             robustness.append(rb)
             rob_by_id[cand.candidate_id] = rb
+            self._persist_artifacts(cand, log)
         if not robustness:
             return len(candidates), killed, queued
 
@@ -394,6 +402,28 @@ class Orchestrator:
         return len(candidates), killed, queued
 
     # --------------------------------------------------------------- helpers
+
+    def _persist_artifacts(
+        self, candidate: StrategyCandidate, log: structlog.stdlib.BoundLogger
+    ) -> None:
+        """Best-effort: persist the candidate's IS + OOS equity-curve artifacts
+        for the dashboard. Never affects routing, evidence, or verdicts; a
+        failure here only means the curve won't be browsable."""
+        if self._artifact_store is None:
+            return
+        try:
+            artifacts = run_candidate_artifacts(
+                candidate,
+                candle_provider=self._candle_provider,
+                config=self._config.backtest_config,
+            )
+        except HarnessError as e:
+            log.info(
+                "orchestrator_artifact_skipped", candidate_id=candidate.candidate_id, reason=str(e)
+            )
+            return
+        for artifact in artifacts:
+            self._artifact_store.save(artifact)
 
     def _run_agent(
         self,

@@ -29,6 +29,9 @@ export default {
         caution: "hsl(var(--survived))",
         neutralStatus: "hsl(var(--neutral-status))",
         danger: "hsl(var(--killed))",
+        // Realized P&L sign only — see index.css / DESIGN.md.
+        pnlPos: "hsl(var(--pnl-pos))",
+        pnlNeg: "hsl(var(--pnl-neg))",
       },
       fontFamily: {
         sans: ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],

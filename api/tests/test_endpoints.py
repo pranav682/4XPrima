@@ -157,10 +157,26 @@ def test_backtest_found_by_oos_hash(seeded_client: TestClient) -> None:
     assert r.json()["in_sample"]["config_hash"] == SURVIVOR_HASH
 
 
-def test_backtest_equity_curve_is_honestly_unavailable(seeded_client: TestClient) -> None:
+def test_backtest_equity_curve_served_when_persisted(seeded_client: TestClient) -> None:
     bt = seeded_client.get(f"/backtests/{SURVIVOR_HASH}").json()
-    assert bt["equity_curve"] == []
+    assert bt["equity_curve_available"] is True
+    art = bt["in_sample_artifact"]
+    assert art is not None
+    # net P&L is captured verbatim (a string), not recomputed by the UI
+    assert art["net_pnl"] == "8200"
+    assert len(art["equity_curve"]) == 5
+    assert art["equity_curve"][0]["equity"] == "100000"
+    # the OOS artifact is attached too
+    assert bt["out_of_sample_artifact"]["net_pnl"] == "360"
+
+
+def test_backtest_equity_curve_honestly_unavailable_without_artifact(
+    seeded_client: TestClient,
+) -> None:
+    # the killed candidate has evidence but no persisted curve artifact
+    bt = seeded_client.get("/backtests/is-killed-hash").json()
     assert bt["equity_curve_available"] is False
+    assert bt["in_sample_artifact"] is None
     assert bt["equity_curve_notice"] == EQUITY_CURVE_NOTICE
 
 

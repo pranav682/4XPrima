@@ -27,6 +27,32 @@ export function money(value: string): string {
   return `$${value}`;
 }
 
+/** Format a verbatim money string for reading: 2dp + thousands separators. The
+ *  underlying value is unchanged; this is display only. */
+export function usd(value: string): string {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return `$${value}`;
+  return n.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+/** Signed money for a realized P&L figure (e.g. "+$2,880.34"). */
+export function signedUsd(value: string): string {
+  const n = Number(value);
+  const body = usd(value).replace("-", "");
+  return n >= 0 ? `+${body}` : `-${body}`;
+}
+
+export function pnlSign(value: string): "pos" | "neg" | "flat" {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n === 0) return "flat";
+  return n > 0 ? "pos" : "neg";
+}
+
 export function shortHash(hash: string, head = 8): string {
   return hash.length > head ? hash.slice(0, head) : hash;
 }

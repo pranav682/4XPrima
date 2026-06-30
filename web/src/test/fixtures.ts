@@ -2,11 +2,43 @@
 // string Decimals); no fabricated/lorem content.
 import type {
   ApprovalItem,
+  BacktestArtifact,
   BacktestDetail,
   CycleSummary,
+  EvidenceSegment,
   Metrics,
   RegistryEntry,
 } from "@/lib/types";
+
+function artifact(configHash: string, segment: EvidenceSegment, net: string): BacktestArtifact {
+  const start = 100000;
+  const end = start + Number(net);
+  return {
+    config_hash: configHash,
+    candidate_id: "cand-survivor",
+    pair: "USDJPY",
+    segment,
+    window_start: "2026-05-01T00:00:00+00:00",
+    window_end: "2026-06-01T00:00:00+00:00",
+    starting_balance: String(start),
+    ending_balance: String(end),
+    ending_equity: String(end),
+    peak_equity: String(Math.max(start, end)),
+    net_pnl: net,
+    return_pct: String(Number(net) / start),
+    max_drawdown_pct: "0.04",
+    trade_count: segment === "in_sample" ? 40 : 6,
+    cost_total: "214.50",
+    bars_processed: 5,
+    halted_due_to_kill_switch: false,
+    equity_curve: [0, 1, 2, 3, 4].map((i) => ({
+      bar_index: i,
+      time: `2026-05-0${i + 1}T00:00:00+00:00`,
+      equity: String(start + (Number(net) * i) / 4),
+      drawdown_pct: "0.00",
+    })),
+  };
+}
 
 export function metrics(over: Partial<Metrics> = {}): Metrics {
   return {
@@ -134,10 +166,10 @@ export const backtestDetail: BacktestDetail = {
   in_sample: survivorEntry.in_sample_evidence,
   out_of_sample: survivorEntry.out_of_sample_evidence,
   critic_verdict: survivorEntry.critic_verdict,
-  equity_curve: [],
-  equity_curve_available: false,
-  equity_curve_notice:
-    "Equity-curve points are not persisted in BacktestEvidence — only summary metrics are stored.",
+  in_sample_artifact: artifact("is-survivor-hash", "in_sample", "8200"),
+  out_of_sample_artifact: artifact("oos-survivor-hash", "out_of_sample", "360"),
+  equity_curve_available: true,
+  equity_curve_notice: "",
 };
 
 function evidence(configHash: string, m: Metrics, segment: "in_sample" | "out_of_sample" = "in_sample") {

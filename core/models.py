@@ -1135,6 +1135,59 @@ class BacktestEvidence(BaseModel):
         return _require_utc(v)
 
 
+class EquityCurvePoint(BaseModel):
+    """One end-of-bar sample of the equity curve, copied VERBATIM from the
+    engine's :class:`core.backtest.types.EquityPoint`. Money is a string
+    (``JsonDecimal``) so it is exact, never re-floated."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    bar_index: int
+    time: datetime
+    equity: JsonDecimal
+    drawdown_pct: JsonDecimal
+
+
+class BacktestArtifact(BaseModel):
+    """A RICH, dashboard-only record of one candidate's backtest over one window
+    — the per-bar equity curve plus headline annotations a trader wants to see.
+
+    This is deliberately SEPARATE from :class:`BacktestEvidence`: evidence is the
+    slim, LLM-facing summary (kept small so agent prompts and the metrics-verbatim
+    integrity gate are untouched), whereas the artifact is heavy and is read ONLY
+    by the read-only web dashboard. Every field is captured from the engine's
+    frozen ``BacktestResult`` at persist time — nothing here is recomputed or
+    re-derived downstream. ``net_pnl`` is the engine's ``ending_equity`` minus its
+    ``starting_balance``, captured once here so the UI never does the arithmetic.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    config_hash: str
+    candidate_id: str
+    pair: str
+    segment: EvidenceSegment
+    window_start: datetime
+    window_end: datetime
+    starting_balance: JsonDecimal
+    ending_balance: JsonDecimal
+    ending_equity: JsonDecimal
+    peak_equity: JsonDecimal
+    net_pnl: JsonDecimal
+    return_pct: JsonDecimal
+    max_drawdown_pct: JsonDecimal
+    trade_count: int
+    cost_total: JsonDecimal
+    bars_processed: int
+    halted_due_to_kill_switch: bool
+    equity_curve: tuple[EquityCurvePoint, ...] = ()
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _utc_only(cls, v: datetime) -> datetime:
+        return _require_utc(v)
+
+
 class BacktestTriage(StrEnum):
     """Where a candidate goes next — a TRIAGE recommendation, not a deployment
     decision (that's the critic + OOS + a human, never this agent)."""

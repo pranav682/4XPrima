@@ -28,10 +28,12 @@ from core.backtest import BacktestEngine, BacktestResult, CostModel, DataSplit
 from core.backtest.metrics import BacktestMetrics
 from core.market_data import CandleProvider, MarketDataError
 from core.models import (
+    BacktestArtifact,
     BacktestEvidence,
     BacktestMetricsView,
     Candle,
     CostStressPoint,
+    EquityCurvePoint,
     EvidenceSegment,
     GateResult,
     ParamNeighborResult,
@@ -227,6 +229,101 @@ def _evidence_from_result(
         gates=gates,
         gates_all_passed=all(g.passed for g in gates),
     )
+
+
+_ARTIFACT_MAX_POINTS = 400
+
+
+def _downsample(curve: Sequence[object], max_points: int = _ARTIFACT_MAX_POINTS) -> list[int]:
+    """Indices of an evenly-spaced subsample of ``curve`` (always including the
+    last point), so a persisted equity curve stays small without distorting its
+    shape. Returns indices, not points, so callers map them to typed rows."""
+    n = len(curve)
+    if n <= max_points:
+        return list(range(n))
+    step = n / max_points
+    idx = sorted({min(n - 1, round(i * step)) for i in range(max_points)} | {n - 1})
+    return idx
+
+
+def build_artifact(
+    candidate: StrategyCandidate,
+    bars: Sequence[Candle],
+    result: BacktestResult,
+    *,
+    segment: EvidenceSegment,
+) -> BacktestArtifact:
+    """A rich, dashboard-only artifact for ONE backtest window — the (downsampled)
+    equity curve plus the headline annotations, all copied VERBATIM from the
+    engine's ``BacktestResult``. Nothing here is recomputed downstream."""
+    sb = result.starting_balance
+    net = result.ending_equity - sb
+    ret = (net / sb) if sb != 0 else Decimal("0")
+    keep = _downsample(result.equity_curve)
+    points = tuple(
+        EquityCurvePoint(
+            bar_index=result.equity_curve[i].bar_index,
+            time=result.equity_curve[i].time,
+            equity=result.equity_curve[i].equity,
+            drawdown_pct=result.equity_curve[i].drawdown_pct,
+        )
+        for i in keep
+    )
+    return BacktestArtifact(
+        config_hash=result.config_hash,
+        candidate_id=candidate.candidate_id,
+        pair=result.pair,
+        segment=segment,
+        window_start=bars[0].time,
+        window_end=bars[-1].time,
+        starting_balance=sb,
+        ending_balance=result.ending_balance,
+        ending_equity=result.ending_equity,
+        peak_equity=result.peak_equity,
+        net_pnl=net,
+        return_pct=ret,
+        max_drawdown_pct=result.max_drawdown_pct,
+        trade_count=sum(1 for t in result.trade_log if t.realized_pnl is not None),
+        cost_total=result.cost_breakdown.total,
+        bars_processed=result.bars_processed,
+        halted_due_to_kill_switch=result.halted_due_to_kill_switch,
+        equity_curve=points,
+    )
+
+
+def run_candidate_artifacts(
+    candidate: StrategyCandidate,
+    *,
+    candle_provider: CandleProvider,
+    config: BacktestRunConfig,
+) -> tuple[BacktestArtifact, ...]:
+    """Build the in-sample and (token-gated) out-of-sample artifacts for ONE
+    candidate — each with its full equity curve — for the dashboard.
+
+    Like :func:`run_robustness`, this opens the sealed OOS slice in deterministic
+    code only; the token never leaves this module. Raises :class:`HarnessError`
+    if the candidate cannot be run at all."""
+    candles = _fetch(candidate, candle_provider=candle_provider, config=config)
+    split = DataSplit(candles, oos_fraction=config.oos_fraction)
+    artifacts: list[BacktestArtifact] = []
+
+    in_sample = split.in_sample
+    if len(in_sample) >= 2:
+        is_result = _run_engine(in_sample, candidate, config=config, cost_model=config.cost_model)
+        artifacts.append(
+            build_artifact(candidate, in_sample, is_result, segment=EvidenceSegment.IN_SAMPLE)
+        )
+
+    oos = split.access_out_of_sample(token=_OOS_CONFIRMATION)
+    if len(oos) >= 2:
+        oos_result = _run_engine(oos, candidate, config=config, cost_model=config.cost_model)
+        artifacts.append(
+            build_artifact(candidate, oos, oos_result, segment=EvidenceSegment.OUT_OF_SAMPLE)
+        )
+
+    if not artifacts:
+        raise HarnessError("no window long enough to backtest for artifacts")
+    return tuple(artifacts)
 
 
 def run_candidate(
@@ -449,8 +546,10 @@ __all__ = [
     "DEFAULT_RISK_CONFIG",
     "BacktestRunConfig",
     "HarnessError",
+    "build_artifact",
     "metrics_view",
     "run_candidate",
+    "run_candidate_artifacts",
     "run_candidate_oos",
     "run_proposal",
     "run_robustness",

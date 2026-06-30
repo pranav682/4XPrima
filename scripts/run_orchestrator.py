@@ -42,6 +42,7 @@ from core.llm_client import OpenAIProvider
 from core.market_data import OandaPriceProvider
 from core.orchestration import (
     ApprovalQueue,
+    BacktestArtifactStore,
     ChampionChallengerRegistry,
     CycleResult,
     Orchestrator,
@@ -89,6 +90,7 @@ def main() -> int:
 
     registry = ChampionChallengerRegistry(args.state_dir / "registry.json")
     queue = ApprovalQueue(args.state_dir / "approval_queue.json")
+    artifacts = BacktestArtifactStore(args.state_dir / "backtests")
 
     fred = FredSettings()  # type: ignore[call-arg]
     openai = OpenAISettings()  # type: ignore[call-arg]
@@ -119,6 +121,7 @@ def main() -> int:
             candle_provider=candles,
             registry=registry,
             approval_queue=queue,
+            artifact_store=artifacts,
             config=config,
         )
         result = orchestrator.run_cycle(universe, cycle_id=cycle_id)

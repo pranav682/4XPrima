@@ -7,10 +7,13 @@ import { PageHeader } from "@/components/PageHeader";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { StateBadge, VerdictBadge } from "@/components/status";
 import { MetricComparison } from "@/components/MetricComparison";
+import { EquityCurveChart } from "@/components/EquityCurveChart";
 import { ConcernList } from "@/components/ConcernList";
+import { SampleCaveat } from "@/components/SampleCaveat";
 import { Stat } from "@/components/ui/misc";
-import { dateUTC, money, titleCase } from "@/lib/format";
-import type { BacktestDetail, Evidence } from "@/lib/types";
+import { cn } from "@/lib/utils";
+import { dateUTC, money, pct, pnlSign, signedUsd, titleCase, usd } from "@/lib/format";
+import type { BacktestArtifact, BacktestDetail, Evidence } from "@/lib/types";
 
 export function BacktestDetailView() {
   const { configHash = "" } = useParams();
@@ -28,32 +31,29 @@ export function BacktestDetailView() {
         empty={() => false}
         children={(bt) => {
           const cand = bt.candidate;
-          const ins = bt.in_sample;
-          const oos = bt.out_of_sample;
           return (
             <>
               <PageHeader
                 title={`${cand.instrument} · ${cand.timeframe} · ${titleCase(cand.archetype)}`}
-                subtitle={`config ${bt.config_hash}`}
+                subtitle={`Selected candidate · config ${bt.config_hash}`}
                 actions={<StateBadge state={bt.state} />}
               />
 
-              <div className="grid grid-cols-1 gap-5 lg:grid-cols-[1fr_320px]">
-                <div className="flex flex-col gap-5">
-                  <Card>
-                    <CardHeader>
-                      <CardTitle>In-sample vs out-of-sample</CardTitle>
-                    </CardHeader>
-                    <CardContent>
-                      <MetricComparison
-                        inSample={ins?.metrics ?? null}
-                        outOfSample={oos?.metrics ?? null}
-                      />
-                    </CardContent>
-                  </Card>
+              {/* Centerpiece: the equity curve + amount-earned annotations. */}
+              <EquitySection bt={bt} />
 
-                  <EquityCurvePanel notice={bt.equity_curve_notice} available={bt.equity_curve_available} />
-                </div>
+              <div className="mt-5 grid grid-cols-1 gap-5 lg:grid-cols-[1fr_320px]">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>In-sample vs out-of-sample</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <MetricComparison
+                      inSample={bt.in_sample?.metrics ?? null}
+                      outOfSample={bt.out_of_sample?.metrics ?? null}
+                    />
+                  </CardContent>
+                </Card>
 
                 <div className="flex flex-col gap-5">
                   <Card>
@@ -70,8 +70,8 @@ export function BacktestDetailView() {
                     </CardContent>
                   </Card>
 
-                  {ins && <RunFacts label="In-sample run" ev={ins} />}
-                  {oos && <RunFacts label="Out-of-sample run" ev={oos} />}
+                  {bt.in_sample && <RunFacts label="In-sample run" ev={bt.in_sample} />}
+                  {bt.out_of_sample && <RunFacts label="Out-of-sample run" ev={bt.out_of_sample} />}
 
                   {bt.critic_verdict && (
                     <Card className="border-survived/30">
@@ -94,6 +94,68 @@ export function BacktestDetailView() {
   );
 }
 
+function EquitySection({ bt }: { bt: BacktestDetail }) {
+  const is = bt.in_sample_artifact;
+  const oos = bt.out_of_sample_artifact;
+  if (!bt.equity_curve_available || (!is && !oos)) {
+    return <EquityCurveUnavailable notice={bt.equity_curve_notice} />;
+  }
+  const start = is?.starting_balance ?? oos?.starting_balance ?? "0";
+  return (
+    <Card>
+      <CardHeader className="flex-row items-center justify-between">
+        <CardTitle>Equity curve</CardTitle>
+        <span className="text-2xs text-muted-foreground">
+          starts at {usd(start)} · in-sample then the sealed out-of-sample slice
+        </span>
+      </CardHeader>
+      <CardContent>
+        <EquityCurveChart inSample={is} outOfSample={oos} />
+        <div className="mt-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
+          <PnlStat label="In-sample earned" artifact={is} />
+          <PnlStat label="Out-of-sample earned" artifact={oos} emphasizeCaveat />
+          <Stat label="In-sample return">{is ? pct(is.return_pct) : "—"}</Stat>
+          <Stat label="Out-of-sample return">{oos ? pct(oos.return_pct) : "—"}</Stat>
+          <Stat label="Peak equity">{is ? usd(is.peak_equity) : "—"}</Stat>
+          <Stat label="Max drawdown (IS)">{is ? pct(is.max_drawdown_pct) : "—"}</Stat>
+          <Stat label="Trades (IS)">{is ? is.trade_count : "—"}</Stat>
+          <Stat label="Trades (OOS)">{oos ? oos.trade_count : "—"}</Stat>
+        </div>
+        {oos && (
+          <SampleCaveat metrics={bt.out_of_sample?.metrics ?? null} className="mt-3" />
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function PnlStat({
+  label,
+  artifact,
+  emphasizeCaveat,
+}: {
+  label: string;
+  artifact: BacktestArtifact | null;
+  emphasizeCaveat?: boolean;
+}) {
+  if (!artifact) {
+    return <Stat label={label}>{emphasizeCaveat ? "not opened" : "—"}</Stat>;
+  }
+  const sign = pnlSign(artifact.net_pnl);
+  return (
+    <Stat label={label} emphasis>
+      <span
+        className={cn(
+          sign === "pos" && "text-pnlPos",
+          sign === "neg" && "text-pnlNeg",
+        )}
+      >
+        {signedUsd(artifact.net_pnl)}
+      </span>
+    </Stat>
+  );
+}
+
 function RunFacts({ label, ev }: { label: string; ev: Evidence }) {
   return (
     <Card>
@@ -112,10 +174,9 @@ function RunFacts({ label, ev }: { label: string; ev: Evidence }) {
   );
 }
 
-/** Honest empty state: the per-bar curve isn't persisted and the API must not
- *  re-derive it. We say so plainly rather than drawing a fabricated line. */
-function EquityCurvePanel({ notice, available }: { notice: string; available: boolean }) {
-  if (available) return null;
+/** Honest fallback when no curve artifact was persisted (e.g. a candidate the
+ *  critic never reached). We say so plainly; a real run persists the curve. */
+function EquityCurveUnavailable({ notice }: { notice: string }) {
   return (
     <Card>
       <CardHeader>
@@ -126,8 +187,7 @@ function EquityCurvePanel({ notice, available }: { notice: string; available: bo
           <LineChart className="h-5 w-5 text-muted-foreground" aria-hidden />
           <p className="mx-auto max-w-md text-xs text-muted-foreground">{notice}</p>
           <p className="mx-auto max-w-md text-2xs text-muted-foreground/80">
-            Once per-bar equity points are persisted (a later slice), the equity curve will render
-            here.
+            A real orchestrator run persists the per-bar curve; this candidate has none stored.
           </p>
         </div>
       </CardContent>

@@ -86,10 +86,21 @@ The UI must editorialize **no more than the reporting agent does**.
    reserved for genuine failures (cycle aborted, budget breach, worker error).
    Each cycle row carries a plain-language summary ("2 proposed · both rejected by
    critic · none queued") so the numbers aren't mistaken for alarms.
-8. **Honest empty/loading/error states**, never a void or a fabricated chart.
-   The equity curve isn't persisted in `BacktestEvidence` and the API must not
-   re-derive it, so we say so plainly instead of drawing a fake line; the
-   in-sample→OOS comparison is the real centerpiece.
+8. **Realized P&L sign ≠ verdict.** The equity curve annotates the amount earned
+   per window; a profit is tinted with a *muted* `pnlPos`/`pnlNeg` token
+   (`--pnl-pos` / `--pnl-neg`), used ONLY for a realized financial figure in a
+   single window. It is never the verdict/registry green — a green in-sample P&L
+   means "this window made money", not "validated", and it always sits next to
+   the out-of-sample figure and the critic's caveats.
+9. **The equity curve is real or absent — never faked.** Per-bar curves are now
+   persisted as a separate `BacktestArtifact` (captured verbatim from the engine's
+   `BacktestResult`, kept OUT of the slim LLM-facing evidence). The dashboard
+   charts the actual curve — in-sample then the sealed out-of-sample slice, with
+   the OOS region demarcated and a break-even line at the starting balance. When a
+   candidate has no persisted artifact, we say so plainly rather than drawing a
+   line. Curve points are charted as numbers (a visual); every annotation reads
+   from the verbatim string the API served.
+10. **Honest empty/loading/error states**, never a void or a fabricated chart.
 
 ## Accessibility
 

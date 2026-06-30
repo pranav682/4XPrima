@@ -26,6 +26,12 @@
   --killed: 0 72% 60%; /* terminated / negative */
   --survived: 38 92% 56%; /* caution — NOT validated, NOT green */
   --neutral-status: 217 30% 62%; /* process facts (cycle completed), calm */
+
+  /* Realized P&L sign ONLY (a financial fact in a single window, e.g. an equity
+   * curve's amount earned). Deliberately muted, and NEVER used for a verdict /
+   * registry state — a green P&L is "this window made money", not "validated". */
+  --pnl-pos: 152 45% 55%;
+  --pnl-neg: 0 72% 60%;
 }
 
 * {

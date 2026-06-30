@@ -236,7 +236,10 @@ def _config(max_usd: str = "5.00", per_call: str = "1.00") -> OrchestratorConfig
 
 
 def _make_orch(
-    tmp_path: Any, runner: MagicMock, config: OrchestratorConfig | None = None
+    tmp_path: Any,
+    runner: MagicMock,
+    config: OrchestratorConfig | None = None,
+    artifact_store: Any = None,
 ) -> tuple[Orchestrator, ChampionChallengerRegistry, ApprovalQueue]:
     registry = ChampionChallengerRegistry(tmp_path / "registry.json")
     queue = ApprovalQueue(tmp_path / "queue.json")
@@ -249,6 +252,7 @@ def _make_orch(
         candle_provider=_provider(),
         registry=registry,
         approval_queue=queue,
+        artifact_store=artifact_store,
         config=config or _config(),
     )
     return orch, registry, queue
@@ -395,6 +399,49 @@ def test_killed_not_queued_survivor_queued_end_to_end(tmp_path: Any) -> None:
     assert pending[0].status == "pending"
     assert pending[0].out_of_sample_evidence is not None  # critic opened OOS
     assert by_id  # silence unused
+
+
+def test_artifacts_persisted_for_critiqued_candidate(tmp_path: Any) -> None:
+    from core.orchestration import BacktestArtifactStore
+
+    a = _candidate("mac-jpy", "USDJPY", "80")  # advances to the critic
+    b = _candidate("mac-eur", "EURUSD", "50")  # backtest-rejected, never critiqued
+    runner = MagicMock()
+    runner.run.side_effect = [
+        _ok(MarketContextReport(run_id="cyc-1", as_of=BASE)),
+        _ok(_proposal([a, b])),
+        _ok(
+            _bt_set({"mac-jpy": BacktestTriage.ADVANCE_TO_CRITIC, "mac-eur": BacktestTriage.REJECT})
+        ),
+        _ok(_critic_set({"mac-jpy": CriticVerdictKind.SURVIVE_FOR_NOW})),
+    ]
+    store = BacktestArtifactStore(tmp_path / "backtests")
+    orch, _registry, _queue = _make_orch(tmp_path, runner, artifact_store=store)
+    orch.run_cycle(("USDJPY", "EURUSD"), cycle_id="cyc-1")
+
+    # The critiqued candidate's IS + OOS curves were persisted; the rejected one
+    # (which never reached the critic) was not.
+    arts = store.all_artifacts()
+    assert {a.candidate_id for a in arts} == {"mac-jpy"}
+    assert {a.segment.value for a in arts} == {"in_sample", "out_of_sample"}
+    assert all(len(a.equity_curve) > 0 for a in arts)
+
+
+def test_no_artifacts_persisted_without_store(tmp_path: Any) -> None:
+    a = _candidate("mac-jpy", "USDJPY", "80")
+    runner = MagicMock()
+    runner.run.side_effect = [
+        _ok(MarketContextReport(run_id="cyc-1", as_of=BASE)),
+        _ok(_proposal([a])),
+        _ok(_bt_set({"mac-jpy": BacktestTriage.ADVANCE_TO_CRITIC})),
+        _ok(_critic_set({"mac-jpy": CriticVerdictKind.SURVIVE_FOR_NOW})),
+    ]
+    # No artifact_store injected → no backtests dir created, cycle still completes.
+    orch, _registry, queue = _make_orch(tmp_path, runner)
+    result = orch.run_cycle(("USDJPY",), cycle_id="cyc-1")
+    assert result.outcome == CycleOutcome.COMPLETED
+    assert not (tmp_path / "backtests").exists()
+    assert len(queue.pending()) == 1
 
 
 def test_critic_kill_records_killed_not_queued(tmp_path: Any) -> None:

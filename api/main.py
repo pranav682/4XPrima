@@ -78,7 +78,14 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
         entry = store.find_evidence(config_hash)
         if entry is None:
             raise HTTPException(status_code=404, detail=f"no backtest evidence for {config_hash!r}")
-        return backtest_detail(config_hash, entry)
+        ins = entry.in_sample_evidence
+        oos = entry.out_of_sample_evidence
+        return backtest_detail(
+            config_hash,
+            entry,
+            in_sample_artifact=store.artifact(ins.config_hash) if ins is not None else None,
+            out_of_sample_artifact=store.artifact(oos.config_hash) if oos is not None else None,
+        )
 
     return app
 

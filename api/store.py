@@ -13,8 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from api.config import ApiSettings
-from core.models import CycleReport
-from core.orchestration import ApprovalQueueEntry, CycleResult, RegistryEntry, RegistryState
+from core.models import BacktestArtifact, CycleReport
+from core.orchestration import (
+    ApprovalQueueEntry,
+    BacktestArtifactStore,
+    CycleResult,
+    RegistryEntry,
+    RegistryState,
+)
 
 
 class DataStore:
@@ -83,6 +89,10 @@ class DataStore:
         return reports
 
     # ------------------------------------------------------------- backtests
+
+    def artifact(self, config_hash: str) -> BacktestArtifact | None:
+        """The rich equity-curve artifact for a run, if one was persisted."""
+        return BacktestArtifactStore(self._s.artifacts_dir).get(config_hash)
 
     def find_evidence(self, config_hash: str) -> RegistryEntry | None:
         """The registry entry whose in-sample OR out-of-sample evidence carries
