@@ -1332,3 +1332,132 @@ class CriticVerdictSet(BaseModel):
     run_id: str
     schema_version: str = "1.0"
     verdicts: tuple[CriticVerdict, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# Cycle report (reporting_agent)
+# ---------------------------------------------------------------------------
+
+
+_RECOMMENDATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\brecommend(s|ed|ing|ation)?\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:should|must|ought to|need to)\s+(?:be\s+)?"
+        r"(?:approv\w+|deploy\w+|promot\w+|adopt\w+|trad\w+|allocat\w+)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:approve|reject)\s+(?:this|it|the|these|that)\b", re.IGNORECASE),
+    re.compile(r"\b(?:i|we|you)\s+(?:suggest|advise|recommend|endorse)\b", re.IGNORECASE),
+    re.compile(r"\bgreen[\s-]?light\b", re.IGNORECASE),
+    re.compile(r"\bworth\s+(?:deploying|approving|trading|promoting)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:is|looks|seems|appears)\s+(?:promising|validated|robust|profitable|a\s+good)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bready\s+(?:to|for)\s+(?:deploy|approv\w+|production|live|trade)\b", re.IGNORECASE
+    ),
+    re.compile(r"\bendors\w+\b", re.IGNORECASE),
+)
+
+
+def _scrub_recommendation(field_name: str, text: str) -> str:
+    """Reject editorializing / recommendation language.
+
+    The reporting agent's failure mode is persuasion: making a queued candidate
+    sound more promising than the critic's verdict warrants, or nudging the
+    operator toward approve/reject. It must do neither — it translates, it does
+    not advise. Belt-and-braces machine check (the prompt also forbids it); also
+    runs against execution intent.
+    """
+    for pattern in _RECOMMENDATION_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            raise ValueError(
+                f"recommendation/editorializing language in {field_name}: matched {m.group()!r}"
+            )
+    return _scrub_execution_intent(field_name, text)
+
+
+class CycleReportSummary(BaseModel):
+    """The cycle's headline counts — copied VERBATIM from the orchestrator's
+    ``CycleResult`` (plus the universe). The reporting agent fabricates none of
+    these; Tier-1 rejects any mismatch."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cycle_id: str
+    outcome: str  # the CycleResult outcome value
+    pairs_covered: tuple[str, ...]
+    candidates_proposed: int
+    candidates_killed: int
+    candidates_queued: int
+    total_cost_usd: JsonDecimal
+    duration_seconds: float
+
+
+class QueuedCandidateReport(BaseModel):
+    """The plain-language write-up of ONE candidate awaiting the operator.
+
+    Framing is mandatory: the critic did NOT kill this; the report says what the
+    critic remains worried about. ``in_sample_metrics`` / ``out_of_sample_metrics``
+    are copied VERBATIM; ``surviving_concerns`` must reproduce EVERY critic
+    concern (the report cannot drop a caveat); ``critic_verdict`` is always
+    ``survive_for_now`` (the queue only holds survivors). ``explanation`` is the
+    agent's neutral prose, scrubbed for recommendation/execution language.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    candidate_id: str
+    identity: str
+    instrument: str
+    timeframe: Granularity
+    archetype: StrategyArchetype
+    critic_verdict: str  # always "survive_for_now"
+    in_sample_metrics: BacktestMetricsView  # verbatim
+    out_of_sample_metrics: BacktestMetricsView | None  # verbatim if present
+    surviving_concerns: tuple[OverfittingConcern, ...]  # verbatim, complete
+    explanation: str  # ≤ 800 chars; "not killed — here's what it's worried about"
+
+    @field_validator("explanation")
+    @classmethod
+    def _explanation_sane(cls, v: str) -> str:
+        if len(v) > 800:
+            raise ValueError("explanation must be ≤ 800 chars")
+        return _scrub_recommendation("explanation", v)
+
+
+class CycleReport(BaseModel):
+    """The reporting_agent's structured output: an honest, readable summary of
+    one cycle for the operator.
+
+    It REPORTS; it does not decide. There is deliberately NO ``recommendation``
+    / ``approve`` / ``verdict`` field for the report itself — nothing here
+    authorizes trading, and the free text is scrubbed for recommendation and
+    execution language. ``operator_decision_notice`` states, in plain language,
+    that the decision is the operator's.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cycle_id: str
+    schema_version: str = "1.0"
+    headline: str  # ≤ 400 chars, neutral
+    summary: CycleReportSummary
+    queued_for_approval: tuple[QueuedCandidateReport, ...] = ()
+    operator_decision_notice: str  # the decision is the operator's; not authorization
+
+    @field_validator("headline")
+    @classmethod
+    def _headline_sane(cls, v: str) -> str:
+        if len(v) > 400:
+            raise ValueError("headline must be ≤ 400 chars")
+        return _scrub_recommendation("headline", v)
+
+    @field_validator("operator_decision_notice")
+    @classmethod
+    def _notice_sane(cls, v: str) -> str:
+        if len(v) > 500:
+            raise ValueError("operator_decision_notice must be ≤ 500 chars")
+        return _scrub_recommendation("operator_decision_notice", v)

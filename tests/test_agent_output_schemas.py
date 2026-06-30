@@ -21,6 +21,7 @@ import pytest
 from core.models import (
     BacktestVerdictSet,
     CriticVerdictSet,
+    CycleReport,
     MarketContextReport,
     StrategyProposal,
 )
@@ -49,7 +50,7 @@ def _lookaround_patterns(schema: dict[str, Any]) -> list[str]:
 
 @pytest.mark.parametrize(
     "model",
-    [BacktestVerdictSet, CriticVerdictSet, StrategyProposal],
+    [BacktestVerdictSet, CriticVerdictSet, StrategyProposal, CycleReport],
     ids=lambda m: m.__name__,
 )
 def test_output_schema_has_no_lookaround_pattern(model: type) -> None:

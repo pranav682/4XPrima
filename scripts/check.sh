@@ -36,6 +36,7 @@ ENFORCED=(
   core/agents/backtest_harness.py    # deterministic backtest + OOS/robustness harness
   core/agents/backtest_agent.py      # backtest interpretation agent
   core/agents/critic_agent.py        # adversarial critic (kill-by-default)
+  core/agents/reporting_agent.py     # human-facing report (no-recommendation)
   core/broker.py            # broker Protocol
   core/config.py            # pydantic-settings config
   core/usage_accounting.py  # per-agent token/cache log

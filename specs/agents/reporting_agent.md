@@ -2,7 +2,13 @@
 
 ## Purpose
 
-The **only** human-facing surface. Summarise P&L and risk events in plain language; explain what the system wants to change and **why**; present approval decisions clearly. Never carries authority — the human's reply is the deciding action.
+The **only** human-facing surface. Turn a finished orchestrator cycle into an honest, readable summary for the operator. Never carries authority — the human's reply, later, is the deciding action.
+
+> **Build status (Stage 3).** Reconciled and implemented as `core/agents/reporting_agent.py` (goes through `llm_client` + `AgentRunner` + the evaluation gate, like the other agents):
+> - **Input is the orchestrator's deterministic output**, not a live fast-loop feed: a `CycleResult` + the pending `ApprovalQueueEntry` items it produced (each with the candidate, in-sample + OOS evidence, and the critic verdict + concerns). The fast-loop P&L/audit excerpt, champion summary, and multi-turn conversation continuity from the original spec are **deferred** — not wired here.
+> - **It REPORTS; it does not decide.** Its failure mode is *editorializing*, and the design blocks it: every metric/count/cost is copied **verbatim** (integrity gate); it must reproduce **every** surviving critic concern (cannot drop a caveat); there is **no** recommendation/approve/deploy field and all free text is scrubbed for recommendation + execution language; a `survive_for_now` candidate is framed as "the critic did not kill this; here is what it remains worried about", never as validated/good.
+> - **No `approval_surface` here.** The named action vocabulary (`approve/reject/defer/ask`) belongs to the **deferred Stage-4 approval CLI**, which this build does not include. The report only states that the decision is the operator's.
+> - **Tier: DEFAULT (gpt-5.4)** for full cycle summaries; **CHEAP (nano)** for short status/tick summaries (selected by the request). On OpenAI with automatic caching there is no compaction beta to guard — CHEAP-tier calls assemble with the same stable prefix.
 
 ## Responsibilities
 
