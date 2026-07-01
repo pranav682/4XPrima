@@ -9,6 +9,7 @@ the honest day-one state.
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,22 @@ class DataStore:
     def artifact(self, config_hash: str) -> BacktestArtifact | None:
         """The rich equity-curve artifact for a run, if one was persisted."""
         return BacktestArtifactStore(self._s.artifacts_dir).get(config_hash)
+
+    def amortized_research_cost(self, run_id: str) -> Decimal | None:
+        """The cycle's LLM cost (verbatim from its CycleResult) spread across the
+        candidates it backtested — the ~flat fixed overhead, independent of
+        capital or trade volume. None if the cycle isn't persisted."""
+        cycle = self.get_cycle(run_id)
+        if cycle is None:
+            return None
+        backtested = [
+            e
+            for e in self.registry_entries()
+            if e.run_id == run_id and e.in_sample_evidence is not None
+        ]
+        if not backtested:
+            return None
+        return cycle.total_cost_usd / Decimal(len(backtested))
 
     def find_evidence(self, config_hash: str) -> RegistryEntry | None:
         """The registry entry whose in-sample OR out-of-sample evidence carries

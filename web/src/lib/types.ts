@@ -179,3 +179,48 @@ export interface Health {
   mode: string;
   paper_only: boolean;
 }
+
+export type EconomicFlag = "ok" | "concern" | "retire";
+
+export interface EconomicConcern {
+  level: "concern" | "retire";
+  reason: string;
+}
+
+export interface WindowEconomics {
+  segment: EvidenceSegment;
+  trade_count: number;
+  net_pnl: string;
+  cost_total: string;
+  gross_pnl: string;
+  return_pct: string;
+  win_rate: number;
+  gross_expectancy_per_trade: string;
+  net_expectancy_per_trade: string | null;
+  cost_per_trade: string | null;
+  avg_win: string | null;
+  avg_loss: string | null;
+  cost_to_edge: number | null;
+  cost_to_edge_label: string;
+  costs_exceed_gross: boolean;
+}
+
+export interface EconomicDecay {
+  in_sample_net_expectancy: string | null;
+  out_of_sample_net_expectancy: string | null;
+  oos_expectancy_fraction_of_is: number | null;
+  oos_return_fraction_of_is: number | null;
+  note: string;
+}
+
+export interface CandidateEconomics {
+  config_hash: string;
+  candidate_id: string;
+  pair: string;
+  in_sample: WindowEconomics;
+  out_of_sample: WindowEconomics | null;
+  decay: EconomicDecay | null;
+  flag: EconomicFlag;
+  concerns: EconomicConcern[];
+  amortized_research_cost_usd: string | null;
+}

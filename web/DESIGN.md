@@ -100,7 +100,21 @@ The UI must editorialize **no more than the reporting agent does**.
    candidate has no persisted artifact, we say so plainly rather than drawing a
    line. Curve points are charted as numbers (a visual); every annotation reads
    from the verbatim string the API served.
-10. **Honest empty/loading/error states**, never a void or a fabricated chart.
+10. **Expectancy, not win rate, is the measure.** Win rate is misleading alone
+    (you can win 90% and lose money), so the Economics view shows it ONLY next to
+    average win, average loss, and expectancy — never as a standalone "success"
+    number, and never styled as good on its own. Net-of-cost expectancy leads;
+    gross is shown but subordinate.
+11. **Edge must dwarf cost.** Cost-to-edge is surfaced prominently ("broker takes
+    X% of gross P&L"). A strategy whose costs eat most of its gross edge is
+    flagged in amber, not celebrated; when costs exceed the gross edge we say so.
+12. **A retire/concern flag is the system working, not an alarm.** An edge that
+    decayed or never cleared its costs is *supposed* to be retired — so economic
+    flags are **amber** (caution), never alarming red, and always carry the
+    specific reason ("net expectancy negative after costs", "broker takes 71% of
+    gross edge", "OOS expectancy 22% of in-sample"). Retire is just the stronger
+    amber, not a failure state.
+13. **Honest empty/loading/error states**, never a void or a fabricated chart.
 
 ## Accessibility
 

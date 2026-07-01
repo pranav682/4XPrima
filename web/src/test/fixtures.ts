@@ -4,11 +4,87 @@ import type {
   ApprovalItem,
   BacktestArtifact,
   BacktestDetail,
+  CandidateEconomics,
   CycleSummary,
+  EconomicFlag,
   EvidenceSegment,
   Metrics,
   RegistryEntry,
+  WindowEconomics,
 } from "@/lib/types";
+
+function windowEcon(
+  segment: EvidenceSegment,
+  over: Partial<WindowEconomics> = {},
+): WindowEconomics {
+  return {
+    segment,
+    trade_count: segment === "in_sample" ? 120 : 45,
+    net_pnl: "4200",
+    cost_total: "210",
+    gross_pnl: "4410",
+    return_pct: "0.042",
+    win_rate: 0.52,
+    gross_expectancy_per_trade: "38.5",
+    net_expectancy_per_trade: "36.75",
+    cost_per_trade: "1.75",
+    avg_win: "120",
+    avg_loss: "50",
+    cost_to_edge: 0.0476,
+    cost_to_edge_label: "Broker takes 4.8% of gross P&L",
+    costs_exceed_gross: false,
+    ...over,
+  };
+}
+
+export const economicsHealthy: CandidateEconomics = {
+  config_hash: "healthy-hash-abc",
+  candidate_id: "cand-healthy",
+  pair: "USDJPY",
+  in_sample: windowEcon("in_sample"),
+  out_of_sample: windowEcon("out_of_sample", { net_pnl: "1800", win_rate: 0.5 }),
+  decay: {
+    in_sample_net_expectancy: "36.75",
+    out_of_sample_net_expectancy: "30.0",
+    oos_expectancy_fraction_of_is: 0.82,
+    oos_return_fraction_of_is: 0.8,
+    note: "Historical decay (in-sample → out-of-sample backtest windows). This is NOT live/forward-test decay — that needs a running champion (not built).",
+  },
+  flag: "ok" as EconomicFlag,
+  concerns: [],
+  amortized_research_cost_usd: "0.0867",
+};
+
+export const economicsRetire: CandidateEconomics = {
+  config_hash: "retire-hash-xyz",
+  candidate_id: "cand-retire",
+  pair: "EURUSD",
+  in_sample: windowEcon("in_sample", { net_pnl: "300", win_rate: 0.48 }),
+  out_of_sample: windowEcon("out_of_sample", {
+    trade_count: 4,
+    net_pnl: "-150",
+    net_expectancy_per_trade: "-2.5",
+    cost_to_edge: null,
+    costs_exceed_gross: true,
+    cost_to_edge_label: "Costs exceed any gross edge — no profit to take a share of",
+  }),
+  decay: {
+    in_sample_net_expectancy: "10.0",
+    out_of_sample_net_expectancy: "-2.5",
+    oos_expectancy_fraction_of_is: -0.25,
+    oos_return_fraction_of_is: -0.3,
+    note: "Historical decay (in-sample → out-of-sample backtest windows). This is NOT live/forward-test decay — that needs a running champion (not built).",
+  },
+  flag: "retire" as EconomicFlag,
+  concerns: [
+    { level: "retire", reason: "Net expectancy negative after costs (out_of_sample)." },
+    {
+      level: "concern",
+      reason: "Out-of-sample rests on 4 trades — below the statistical-power floor of 30.",
+    },
+  ],
+  amortized_research_cost_usd: "0.0867",
+};
 
 function artifact(configHash: string, segment: EvidenceSegment, net: string): BacktestArtifact {
   const start = 100000;

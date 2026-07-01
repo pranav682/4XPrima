@@ -4,6 +4,7 @@
 import type {
   ApprovalItem,
   BacktestDetail,
+  CandidateEconomics,
   CycleDetail,
   CycleSummary,
   Health,
@@ -43,4 +44,5 @@ export const api = {
   approvalQueue: () => get<ApprovalItem[]>("/approval-queue"),
   backtest: (configHash: string) =>
     get<BacktestDetail>(`/backtests/${encodeURIComponent(configHash)}`),
+  economics: () => get<CandidateEconomics[]>("/economics"),
 };

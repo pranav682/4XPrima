@@ -25,6 +25,8 @@ from api.serializers import (
     registry_entry,
 )
 from api.store import DataStore
+from core.analysis.economics import candidate_economics
+from core.orchestration import RegistryEntry
 
 
 def create_app(settings: ApiSettings | None = None) -> FastAPI:
@@ -72,6 +74,28 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
     def get_approval_queue() -> list[dict[str, Any]]:
         reports = store.saved_reports()
         return [approval_item(e, reports.get(e.cycle_id)) for e in store.pending_queue()]
+
+    def _economics(entry: RegistryEntry) -> dict[str, Any]:
+        # entry.in_sample_evidence is guaranteed non-None by the callers below.
+        assert entry.in_sample_evidence is not None
+        return candidate_economics(
+            entry.in_sample_evidence,
+            entry.out_of_sample_evidence,
+            amortized_research_cost_usd=store.amortized_research_cost(entry.run_id),
+        ).model_dump(mode="json")
+
+    @app.get("/economics")
+    def list_economics() -> list[dict[str, Any]]:
+        """Net-of-cost economics + historical (IS->OOS) decay read per candidate.
+        HISTORICAL backtest economics only — not live/forward-test monitoring."""
+        return [_economics(e) for e in store.registry_entries() if e.in_sample_evidence is not None]
+
+    @app.get("/economics/{config_hash}")
+    def get_economics(config_hash: str) -> dict[str, Any]:
+        entry = store.find_evidence(config_hash)
+        if entry is None or entry.in_sample_evidence is None:
+            raise HTTPException(status_code=404, detail=f"no economics for {config_hash!r}")
+        return _economics(entry)
 
     @app.get("/backtests/{config_hash}")
     def get_backtest(config_hash: str) -> dict[str, Any]:

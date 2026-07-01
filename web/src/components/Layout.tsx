@@ -1,5 +1,12 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Activity, ListChecks, FlaskConical, GitBranch, ShieldAlert } from "lucide-react";
+import {
+  Activity,
+  ListChecks,
+  FlaskConical,
+  GitBranch,
+  Scale,
+  ShieldAlert,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV = [
@@ -7,6 +14,7 @@ const NAV = [
   { to: "/registry", label: "Registry", icon: GitBranch },
   { to: "/approval-queue", label: "Approval queue", icon: ListChecks },
   { to: "/backtests", label: "Backtests", icon: FlaskConical },
+  { to: "/economics", label: "Economics", icon: Scale },
 ];
 
 export function Layout() {

@@ -55,6 +55,23 @@ python -m scripts.run_reporting --cycle data/orchestration/cycles/<id>.json   # 
 | GET | `/registry` | champion/challenger entries (params, IS+OOS metrics, critic verdict + concerns) |
 | GET | `/approval-queue` | pending entries + the reporting-agent framing where a report exists |
 | GET | `/backtests/{config_hash}` | stored `BacktestEvidence` (in-sample + OOS), found by either hash |
+| GET | `/economics` | net-of-cost economics + historical (IS→OOS) decay read + retire/concern flags, per candidate |
+| GET | `/economics/{config_hash}` | the same economics for one candidate |
+
+### A note on the economics + decay panel
+
+`/economics` is computed by a single deterministic helper
+(`core/analysis/economics.py`) from the **already-persisted** `BacktestEvidence`
+— it reads verbatim values and does only arithmetic (net expectancy =
+`avg_trade_pnl − cost_total/trade_count`; cost-to-edge = `cost / gross P&L`;
+decay = OOS expectancy ÷ IS expectancy). It **never** re-runs the engine (a test
+asserts it imports neither `core.backtest` nor `BacktestEngine`). The
+retire/concern flags come from documented thresholds in `EconomicsThresholds`.
+
+This is **historical backtest economics** (in-sample vs the sealed out-of-sample
+slice). True *live* decay monitoring — comparing a running champion's
+forward-test results to its expected band — requires the Stage-4 approval action
++ a paper-forward-test, which is **not built**. The panel says so plainly.
 
 ### A note on the equity curve
 

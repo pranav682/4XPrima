@@ -194,5 +194,59 @@ def test_empty_states_are_honest(empty_client: TestClient) -> None:
     assert empty_client.get("/cycles").json() == []
     assert empty_client.get("/registry").json() == []
     assert empty_client.get("/approval-queue").json() == []
+    assert empty_client.get("/economics").json() == []
     assert empty_client.get("/cycles/anything").status_code == 404
     assert empty_client.get("/backtests/anything").status_code == 404
+    assert empty_client.get("/economics/anything").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# economics
+# ---------------------------------------------------------------------------
+
+
+def test_economics_list_per_candidate(seeded_client: TestClient) -> None:
+    rows = seeded_client.get("/economics").json()
+    assert len(rows) == 2
+    for r in rows:
+        assert r["flag"] in {"ok", "concern", "retire"}
+        assert r["in_sample"] is not None
+        # win rate is surfaced together with the per-trade edge (never alone)
+        assert "win_rate" in r["in_sample"]
+        assert "net_expectancy_per_trade" in r["in_sample"]
+        # amortized research cost is verbatim (cycle LLM cost / backtested count)
+        assert r["amortized_research_cost_usd"] == "0.0867"
+
+
+def test_economics_detail_has_decay_and_cost_to_edge(seeded_client: TestClient) -> None:
+    r = seeded_client.get(f"/economics/{SURVIVOR_HASH}").json()
+    assert r["out_of_sample"] is not None
+    assert r["decay"] is not None
+    assert "NOT live" in r["decay"]["note"]
+    # cost-to-edge label is human-readable
+    assert (
+        "Broker takes" in r["in_sample"]["cost_to_edge_label"]
+        or r["in_sample"]["costs_exceed_gross"]
+    )
+
+
+def test_economics_thin_oos_is_flagged(seeded_client: TestClient) -> None:
+    # the survivor's OOS rests on 6 trades — below the statistical-power floor
+    r = seeded_client.get(f"/economics/{SURVIVOR_HASH}").json()
+    assert r["flag"] in {"concern", "retire"}
+    assert any("statistical-power floor" in c["reason"] for c in r["concerns"])
+
+
+def test_economics_404(seeded_client: TestClient) -> None:
+    assert seeded_client.get("/economics/unknown-hash").status_code == 404
+
+
+def test_api_does_not_import_the_backtest_engine() -> None:
+    import pathlib
+
+    api_dir = pathlib.Path(__file__).resolve().parents[1]
+    for mod in ("main.py", "store.py", "serializers.py", "config.py"):
+        src = (api_dir / mod).read_text()
+        imports = [ln for ln in src.splitlines() if ln.strip().startswith(("import ", "from "))]
+        assert not any("BacktestEngine" in ln for ln in imports), mod
+        assert not any("core.backtest" in ln for ln in imports), mod
