@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from core.analysis.pair_screener import ScreeningReport
 from core.models import BacktestArtifact, CycleReport
 from core.orchestration import ApprovalQueueEntry, CycleResult, RegistryEntry
 
@@ -97,11 +98,48 @@ def backtest_detail(
     }
 
 
+EMPTY_UNIVERSE: dict[str, Any] = {
+    "available": False,
+    "as_of": None,
+    "granularity": None,
+    "lookback_count": None,
+    "candidate_pairs": [],
+    "admitted": [],
+    "dropped": [],
+    "correlation": {"pairs": [], "matrix": []},
+    "profiles": [],
+}
+
+
+def universe_view(report: ScreeningReport) -> dict[str, Any]:
+    """The screener's STRUCTURAL decisions — admitted shortlist + dropped pairs
+    with reasons + the return-correlation matrix + per-pair structural profiles.
+
+    Structural fields ONLY: the screener never ranks by historical return, so
+    nothing here is a profitability score (a test asserts no return field leaks)."""
+    d = report.model_dump(mode="json")
+    return {
+        "available": True,
+        "as_of": d["as_of"],
+        "granularity": d["granularity"],
+        "lookback_count": d["lookback_count"],
+        "candidate_pairs": d["candidate_pairs"],
+        # shortlist = admitted (each carries the structural selection reason);
+        # excluded = dropped (each carries the structural drop reason).
+        "admitted": d["shortlist"],
+        "dropped": d["excluded"],
+        "correlation": d["correlation"],
+        "profiles": d["profiles"],
+    }
+
+
 __all__ = [
+    "EMPTY_UNIVERSE",
     "EQUITY_CURVE_NOTICE",
     "approval_item",
     "backtest_detail",
     "cycle_detail",
     "cycle_summary",
     "registry_entry",
+    "universe_view",
 ]

@@ -57,6 +57,20 @@ python -m scripts.run_reporting --cycle data/orchestration/cycles/<id>.json   # 
 | GET | `/backtests/{config_hash}` | stored `BacktestEvidence` (in-sample + OOS), found by either hash |
 | GET | `/economics` | net-of-cost economics + historical (IS→OOS) decay read + retire/concern flags, per candidate |
 | GET | `/economics/{config_hash}` | the same economics for one candidate |
+| GET | `/universe` | the pair screener's structural decisions: admitted / dropped (+ reasons) + the return-correlation matrix |
+
+### A note on the universe screen
+
+`/universe` reads a persisted `ScreeningReport` (from `core/analysis/pair_screener.py`)
+and returns its **structural** decisions only: the admitted shortlist and the
+dropped pairs, each with the structural reason (cost-to-move / spread-to-ATR,
+mutual correlation vs already-selected, data coverage), plus the correlation
+matrix. The screener **never ranks by historical return** — a test asserts no
+return/profitability field leaks into the response. Day one (no screen persisted)
+returns `available: false` with empty lists, and the UI shows a designed empty
+state. The demo seed (`scripts/seed_demo_dashboard.py`) runs the real screener
+over a broader candidate set so admits *and* drops (correlation / cost / coverage)
+are visible.
 
 ### A note on the economics + decay panel
 

@@ -10,8 +10,59 @@ import type {
   EvidenceSegment,
   Metrics,
   RegistryEntry,
+  UniverseView,
   WindowEconomics,
 } from "@/lib/types";
+
+export const universeData: UniverseView = {
+  available: true,
+  as_of: "2026-06-01T00:00:00+00:00",
+  granularity: "D",
+  lookback_count: 500,
+  candidate_pairs: ["AUDUSD", "EURUSD", "USDCHF", "NZDUSD", "EURGBP"],
+  admitted: [
+    {
+      pair: "AUDUSD",
+      selection_rank: 1,
+      cost_to_move: "0.0181",
+      max_correlation_with_selected: 0.0,
+      reason: "lowest cost-to-move among eligible (spread/ATR=0.0181)",
+    },
+    {
+      pair: "EURUSD",
+      selection_rank: 2,
+      cost_to_move: "0.0188",
+      max_correlation_with_selected: 0.05,
+      reason: "cost-to-move spread/ATR=0.0188; |corr| 0.05 with selected <= 0.80",
+    },
+  ],
+  dropped: [
+    { pair: "NZDUSD", reason: "|correlation| 1.00 with AUDUSD exceeds 0.80" },
+    { pair: "USDCHF", reason: "cost-to-move spread/ATR 3.98 > 0.25" },
+    { pair: "EURGBP", reason: "insufficient data (44 < 100 candles)" },
+  ],
+  correlation: {
+    pairs: ["AUDUSD", "EURUSD", "NZDUSD"],
+    matrix: [
+      [1.0, 0.05, 1.0],
+      [0.05, 1.0, 0.04],
+      [1.0, 0.04, 1.0],
+    ],
+  },
+  profiles: [],
+};
+
+export const universeEmpty: UniverseView = {
+  available: false,
+  as_of: null,
+  granularity: null,
+  lookback_count: null,
+  candidate_pairs: [],
+  admitted: [],
+  dropped: [],
+  correlation: { pairs: [], matrix: [] },
+  profiles: [],
+};
 
 function windowEcon(
   segment: EvidenceSegment,

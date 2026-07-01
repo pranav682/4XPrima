@@ -4,6 +4,7 @@ import {
   ListChecks,
   FlaskConical,
   GitBranch,
+  Globe,
   Scale,
   ShieldAlert,
 } from "lucide-react";
@@ -11,6 +12,7 @@ import { cn } from "@/lib/utils";
 
 const NAV = [
   { to: "/cycles", label: "Cycles", icon: Activity },
+  { to: "/universe", label: "Universe", icon: Globe },
   { to: "/registry", label: "Registry", icon: GitBranch },
   { to: "/approval-queue", label: "Approval queue", icon: ListChecks },
   { to: "/backtests", label: "Backtests", icon: FlaskConical },

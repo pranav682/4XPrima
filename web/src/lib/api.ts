@@ -9,6 +9,7 @@ import type {
   CycleSummary,
   Health,
   RegistryEntry,
+  UniverseView,
 } from "./types";
 
 const BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "/api";
@@ -45,4 +46,5 @@ export const api = {
   backtest: (configHash: string) =>
     get<BacktestDetail>(`/backtests/${encodeURIComponent(configHash)}`),
   economics: () => get<CandidateEconomics[]>("/economics"),
+  universe: () => get<UniverseView>("/universe"),
 };

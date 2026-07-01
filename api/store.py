@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from api.config import ApiSettings
+from core.analysis.pair_screener import ScreeningReport
 from core.models import BacktestArtifact, CycleReport
 from core.orchestration import (
     ApprovalQueueEntry,
@@ -88,6 +89,18 @@ class DataStore:
             if parsed is not None:
                 reports[parsed.cycle_id] = parsed
         return reports
+
+    # ------------------------------------------------------------- universe
+
+    def screening_report(self) -> ScreeningReport | None:
+        """The persisted structural pair-screen, if one was run."""
+        path = self._s.universe_path
+        if not path.is_file():
+            return None
+        try:
+            return ScreeningReport.model_validate_json(path.read_text())
+        except (ValueError, OSError):
+            return None
 
     # ------------------------------------------------------------- backtests
 

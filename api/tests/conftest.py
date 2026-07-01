@@ -16,6 +16,12 @@ from fastapi.testclient import TestClient
 
 from api.config import ApiSettings
 from api.main import create_app
+from core.analysis.pair_screener import (
+    CorrelationMatrix,
+    ExclusionEntry,
+    ScreeningReport,
+    ShortlistEntry,
+)
 from core.models import (
     BacktestArtifact,
     BacktestEvidence,
@@ -326,6 +332,39 @@ def _seed(data_dir: Path) -> None:
     artifacts = BacktestArtifactStore(data_dir / "backtests")
     artifacts.save(_artifact(SURVIVOR_HASH, EvidenceSegment.IN_SAMPLE, "8200"))
     artifacts.save(_artifact(SURVIVOR_OOS_HASH, EvidenceSegment.OUT_OF_SAMPLE, "360"))
+
+    (data_dir / "universe.json").write_text(_screening_report().model_dump_json())
+
+
+def _screening_report() -> ScreeningReport:
+    return ScreeningReport(
+        as_of=BASE,
+        granularity=Granularity.D,
+        lookback_count=500,
+        candidate_pairs=("EURUSD", "GBPUSD", "USDCHF", "NZDUSD"),
+        profiles=(),
+        correlation=CorrelationMatrix(pairs=("EURUSD", "GBPUSD"), matrix=((1.0, 0.2), (0.2, 1.0))),
+        shortlist=(
+            ShortlistEntry(
+                pair="EURUSD",
+                selection_rank=1,
+                cost_to_move=Decimal("0.02"),
+                max_correlation_with_selected=0.0,
+                reason="lowest cost-to-move among eligible (spread/ATR=0.02)",
+            ),
+            ShortlistEntry(
+                pair="GBPUSD",
+                selection_rank=2,
+                cost_to_move=Decimal("0.03"),
+                max_correlation_with_selected=0.2,
+                reason="cost-to-move spread/ATR=0.03; |corr| 0.20 with selected <= 0.80",
+            ),
+        ),
+        excluded=(
+            ExclusionEntry(pair="USDCHF", reason="cost-to-move spread/ATR 3.50 > 0.25"),
+            ExclusionEntry(pair="NZDUSD", reason="|correlation| 0.92 with EURUSD exceeds 0.80"),
+        ),
+    )
 
 
 @pytest.fixture

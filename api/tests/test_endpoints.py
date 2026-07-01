@@ -241,6 +241,42 @@ def test_economics_404(seeded_client: TestClient) -> None:
     assert seeded_client.get("/economics/unknown-hash").status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# universe (pair screener)
+# ---------------------------------------------------------------------------
+
+
+def test_universe_admitted_and_dropped_with_reasons(seeded_client: TestClient) -> None:
+    u = seeded_client.get("/universe").json()
+    assert u["available"] is True
+    assert [a["pair"] for a in u["admitted"]] == ["EURUSD", "GBPUSD"]
+    dropped = {d["pair"]: d["reason"] for d in u["dropped"]}
+    assert "cost-to-move" in dropped["USDCHF"]  # dropped for cost
+    assert "correlation" in dropped["NZDUSD"]  # dropped for correlation
+
+
+def test_universe_correlation_matrix(seeded_client: TestClient) -> None:
+    corr = seeded_client.get("/universe").json()["correlation"]
+    assert corr["pairs"] == ["EURUSD", "GBPUSD"]
+    assert corr["matrix"][0][0] == 1.0
+    assert corr["matrix"][0][1] == 0.2
+
+
+def test_universe_exposes_no_return_ranking_field(seeded_client: TestClient) -> None:
+    import json
+
+    blob = json.dumps(seeded_client.get("/universe").json()).lower()
+    for forbidden in ("total_return", "profit_factor", '"pnl"', "expectancy", "sharpe", "win_rate"):
+        assert forbidden not in blob, f"universe leaked a return field: {forbidden}"
+
+
+def test_universe_empty_on_day_one(empty_client: TestClient) -> None:
+    u = empty_client.get("/universe").json()
+    assert u["available"] is False
+    assert u["admitted"] == []
+    assert u["dropped"] == []
+
+
 def test_api_does_not_import_the_backtest_engine() -> None:
     import pathlib
 

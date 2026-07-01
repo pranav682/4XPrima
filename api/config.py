@@ -48,5 +48,9 @@ class ApiSettings(BaseSettings):
     def artifacts_dir(self) -> Path:
         return self.data_dir / "backtests"
 
+    @property
+    def universe_path(self) -> Path:
+        return self.data_dir / "universe.json"
+
 
 __all__ = ["ApiSettings"]

@@ -114,7 +114,15 @@ The UI must editorialize **no more than the reporting agent does**.
     specific reason ("net expectancy negative after costs", "broker takes 71% of
     gross edge", "OOS expectancy 22% of in-sample"). Retire is just the stronger
     amber, not a failure state.
-13. **Honest empty/loading/error states**, never a void or a fabricated chart.
+13. **The universe is narrowed on structure, never on return.** The Universe view
+    shows *why* each pair was admitted or dropped — cost-to-move, mutual
+    correlation, data coverage — and never a profitability ranking (selecting by
+    past return is selection bias). A **dropped** pair is the screener working, so
+    it is amber (caution), not red. In the correlation heatmap, **higher |corr| is
+    a caution** (pairs that move together aren't diversification), so cells warm
+    with correlation — the one place we colour by a value, and it's a risk signal,
+    not a reward.
+14. **Honest empty/loading/error states**, never a void or a fabricated chart.
 
 ## Accessibility
 

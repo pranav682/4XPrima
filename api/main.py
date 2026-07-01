@@ -18,11 +18,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.config import ApiSettings
 from api.serializers import (
+    EMPTY_UNIVERSE,
     approval_item,
     backtest_detail,
     cycle_detail,
     cycle_summary,
     registry_entry,
+    universe_view,
 )
 from api.store import DataStore
 from core.analysis.economics import candidate_economics
@@ -83,6 +85,16 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
             entry.out_of_sample_evidence,
             amortized_research_cost_usd=store.amortized_research_cost(entry.run_id),
         ).model_dump(mode="json")
+
+    @app.get("/universe")
+    def get_universe() -> dict[str, Any]:
+        """The pair screener's STRUCTURAL universe decisions (admitted / dropped +
+        reasons, correlation matrix). Never ranked by historical return. Returns
+        an empty, available=false shape when no screen has been run (day one)."""
+        report = store.screening_report()
+        if report is None:
+            return dict(EMPTY_UNIVERSE)
+        return universe_view(report)
 
     @app.get("/economics")
     def list_economics() -> list[dict[str, Any]]:

@@ -7,6 +7,7 @@ import { ApprovalQueueView } from "@/views/ApprovalQueueView";
 import { BacktestsView } from "@/views/BacktestsView";
 import { BacktestDetailView } from "@/views/BacktestDetailView";
 import { EconomicsView } from "@/views/EconomicsView";
+import { UniverseView } from "@/views/UniverseView";
 
 export function AppRoutes() {
   return (
@@ -20,6 +21,7 @@ export function AppRoutes() {
         <Route path="backtests" element={<BacktestsView />} />
         <Route path="backtests/:configHash" element={<BacktestDetailView />} />
         <Route path="economics" element={<EconomicsView />} />
+        <Route path="universe" element={<UniverseView />} />
         <Route path="*" element={<Navigate to="/cycles" replace />} />
       </Route>
     </Routes>

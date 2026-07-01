@@ -224,3 +224,33 @@ export interface CandidateEconomics {
   concerns: EconomicConcern[];
   amortized_research_cost_usd: string | null;
 }
+
+export interface AdmittedPair {
+  pair: string;
+  selection_rank: number;
+  cost_to_move: string | null;
+  max_correlation_with_selected: number;
+  reason: string;
+}
+
+export interface DroppedPair {
+  pair: string;
+  reason: string;
+}
+
+export interface UniverseCorrelation {
+  pairs: string[];
+  matrix: number[][];
+}
+
+export interface UniverseView {
+  available: boolean;
+  as_of: string | null;
+  granularity: string | null;
+  lookback_count: number | null;
+  candidate_pairs: string[];
+  admitted: AdmittedPair[];
+  dropped: DroppedPair[];
+  correlation: UniverseCorrelation;
+  profiles: unknown[];
+}
